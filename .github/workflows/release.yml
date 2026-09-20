@@ -1,72 +1,49 @@
 name: Publish plugin release
-
-# Un tag `v<versión>` publica la release: el ZIP instalable y su .sha256.
-# La versión del tag tiene que ser la de plugin_version.lua; si no, falla
-# antes de publicar nada.
-
 on:
   push:
-    tags:
-      - "v*"
-
+    tags: ['v*']
 permissions:
   contents: write
-
 jobs:
   release:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-
-      - name: Check the tag matches plugin_version.lua
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Test packaging
+        run: python -m unittest discover -s scripts -p 'test_*.py'
+      - name: Verify version and build installable archives
+        run: python scripts/package.py --tag "$GITHUB_REF_NAME"
+      - name: Prepare release notes
         run: |
           set -euo pipefail
-          tag_version="${GITHUB_REF_NAME#v}"
-          file_version="$(sed -nE 's/^return\s+["'"'"']([^"'"'"']+)["'"'"'].*/\1/p' highlightsdetoto.koplugin/plugin_version.lua)"
-          echo "tag=$tag_version file=$file_version"
-          if [ "$tag_version" != "$file_version" ]; then
-            echo "El tag no coincide con plugin_version.lua" >&2
-            exit 1
-          fi
-          echo "VERSION=$tag_version" >> "$GITHUB_ENV"
+          version="${GITHUB_REF_NAME#v}"
+          cat > dist/NOTES.md <<'NOTES'
+          ## Descargar / Download
 
-      - name: Package the plugin
-        run: |
-          set -euo pipefail
-          name="highlightsdetoto.koplugin-${VERSION}.zip"
-          mkdir -p dist
-          # Nunca viajan la configuración local ni las pruebas.
-          rm -f highlightsdetoto.koplugin/web_config.json highlightsdetoto.koplugin/dropbox_config.json
-          rm -rf highlightsdetoto.koplugin/spec
-          # Marca de tiempo fija: el mismo contenido da el mismo ZIP.
-          find highlightsdetoto.koplugin -exec touch -t 200001010000 {} +
-          zip -X -r -q "dist/$name" highlightsdetoto.koplugin -x '*/.*'
-          (cd dist && sha256sum "$name" > "$name.sha256")
-          cat "dist/$name.sha256"
+          **KOReader:** descargá / download **borges.koplugin.zip** abajo / below.
+          Extraé / extract `highlightsdetoto.koplugin` dentro de / into `koreader/plugins/` y reiniciá / restart KOReader.
+          [Guía en castellano](https://github.com/totokatz/borges.koplugin#instalar) · [English guide](https://github.com/totokatz/borges.koplugin/blob/main/docs/README.en.md)
 
-      - name: Extract release notes for this version
-        run: |
-          set -euo pipefail
-          awk -v v="## ${VERSION}" '
-            $0 == v { on = 1; next }
-            on && /^## / { exit }
-            on { print }
-          ' highlightsdetoto.koplugin/RELEASE_NOTES.md > dist/NOTES.md
-          if [ ! -s dist/NOTES.md ]; then
-            echo "Versión ${VERSION} de Borges para KOReader." > dist/NOTES.md
-          fi
-          cat dist/NOTES.md
+          **CrossPoint / Xteink X4:** [descarga e instalación / download and installation](https://github.com/totokatz/borges.koplugin/blob/main/docs/CROSSPOINT.md).
 
-      - name: Publish the release
+          Los archivos **Source code** no son instalables. / **Source code** archives are not installation packages.
+          El ZIP con nombre anterior es idéntico y se conserva para enlaces existentes. / The legacy-named ZIP is identical and kept for existing links.
+
+          ## Cambios / Changes
+          NOTES
+          awk -v v="## ${version}" '$0 == v { on = 1; next } on && /^## / { exit } on { print }' highlightsdetoto.koplugin/RELEASE_NOTES.md >> dist/NOTES.md
+      - name: Publish new release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          # Published archives are immutable: never silently replace downloads.
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            gh release upload "$GITHUB_REF_NAME" dist/*.zip dist/*.sha256 --clobber
-          else
-            gh release create "$GITHUB_REF_NAME" dist/*.zip dist/*.sha256 \
-              --title "Borges para KOReader ${VERSION}" \
-              --notes-file dist/NOTES.md
+            echo 'This release already exists. Publish a new version instead.' >&2
+            exit 1
           fi
+          gh release create "$GITHUB_REF_NAME" dist/*.zip dist/*.sha256 --verify-tag --title "Borges para KOReader ${GITHUB_REF_NAME#v}" --notes-file dist/NOTES.md

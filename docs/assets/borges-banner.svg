@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="460" viewBox="0 0 1280 460" role="img" aria-labelledby="title desc">
+<title id="title">borges. — Lo que leés se queda con vos.</title>
+<desc id="desc">Descargas para KOReader y CrossPoint. Identidad de borges.runadev.com: negro, blanco y gris.</desc>
+<rect width="1280" height="460" fill="#000"/>
+<g font-family="Inter,Arial,Helvetica,sans-serif">
+<text x="64" y="77" fill="#f0f0ef" font-size="42" font-weight="550" letter-spacing="-2.4">borges<tspan fill="#a9a9ad">.</tspan></text>
+<text x="1216" y="69" text-anchor="end" fill="#86868b" font-size="12">KOReader / CrossPoint</text>
+<path d="M64 106h1152" stroke="#292929"/>
+<text x="64" y="167" fill="#959599" font-size="11" letter-spacing="1.8">UNA VIDA ENTRE LÍNEAS</text>
+<text x="60" y="248" fill="#f0f0ef" font-size="68" font-weight="450" letter-spacing="-3.5">Lo que leés</text>
+<text x="60" y="325" fill="#f0f0ef" font-size="68" font-weight="450" letter-spacing="-3.5">se queda <tspan fill="#86868b">con vos.</tspan></text>
+<text x="64" y="405" fill="#aaa9ad" font-size="16">Tu biblioteca, también en tu lector.</text>
+<text x="1216" y="405" text-anchor="end" fill="#86868b" font-size="12">borges.runadev.com ↗</text>
+</g></svg>

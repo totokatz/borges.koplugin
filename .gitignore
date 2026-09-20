@@ -2,3 +2,4 @@ highlightsdetoto.koplugin/web_config.json
 highlightsdetoto.koplugin/dropbox_config.json
 dist/
 artifacts/
+__pycache__/
