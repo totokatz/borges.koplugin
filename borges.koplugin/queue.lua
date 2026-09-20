@@ -1,4 +1,4 @@
---- Durable Borges Sync v2 outbox/inbox plus a lossless legacy compatibility queue.
+--- Durable Borges v2 outbox/inbox plus a lossless legacy compatibility queue.
 
 local QueueStorage = require("queuestorage")
 local rapidjson = require("rapidjson")

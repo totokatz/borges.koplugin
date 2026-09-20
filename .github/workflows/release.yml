@@ -22,20 +22,19 @@ jobs:
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
           cat > dist/NOTES.md <<'NOTES'
-          ## Descargar / Download
+          ## Download Borges
 
-          **KOReader:** descargá / download **borges.koplugin.zip** abajo / below.
-          Extraé / extract `highlightsdetoto.koplugin` dentro de / into `koreader/plugins/` y reiniciá / restart KOReader.
-          [Guía en castellano](https://github.com/totokatz/borges.koplugin#instalar) · [English guide](https://github.com/totokatz/borges.koplugin/blob/main/docs/README.en.md)
+          Download **borges.koplugin.zip** below. Extract `borges.koplugin` into `koreader/plugins/` and restart KOReader.
+          [Installation guide](https://github.com/totokatz/borges.koplugin#install-in-three-steps) · [Español](https://github.com/totokatz/borges.koplugin/blob/main/docs/README.es.md)
 
-          **CrossPoint / Xteink X4:** [descarga e instalación / download and installation](https://github.com/totokatz/borges.koplugin/blob/main/docs/CROSSPOINT.md).
+          **Updating an earlier installation:** close KOReader, rename the existing Borges plugin folder to `borges.koplugin`, then copy the new files over it. Keep your local configuration and leave only one copy of the plugin.
 
-          Los archivos **Source code** no son instalables. / **Source code** archives are not installation packages.
-          El ZIP con nombre anterior es idéntico y se conserva para enlaces existentes. / The legacy-named ZIP is identical and kept for existing links.
+          **Borges for Xteink X4:** [download and installation](https://github.com/totokatz/borges.koplugin/blob/main/docs/FIRMWARE.md).
+          GitHub's **Source code** archives are not installation packages.
 
-          ## Cambios / Changes
+          ## Changes
           NOTES
-          awk -v v="## ${version}" '$0 == v { on = 1; next } on && /^## / { exit } on { print }' highlightsdetoto.koplugin/RELEASE_NOTES.md >> dist/NOTES.md
+          awk -v v="## ${version}" '$0 == v { on = 1; next } on && /^## / { exit } on { print }' borges.koplugin/RELEASE_NOTES.md >> dist/NOTES.md
       - name: Publish new release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -46,4 +45,4 @@ jobs:
             echo 'This release already exists. Publish a new version instead.' >&2
             exit 1
           fi
-          gh release create "$GITHUB_REF_NAME" dist/*.zip dist/*.sha256 --verify-tag --title "Borges para KOReader ${GITHUB_REF_NAME#v}" --notes-file dist/NOTES.md
+          gh release create "$GITHUB_REF_NAME" dist/*.zip dist/*.sha256 --verify-tag --title "Borges for KOReader ${GITHUB_REF_NAME#v}" --notes-file dist/NOTES.md

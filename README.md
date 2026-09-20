@@ -1,130 +1,73 @@
-<p align="center"><img src="docs/assets/borges-banner.svg" alt="Borges — Tu lectura sigue con vos. KOReader y CrossPoint." width="100%"></p>
+<p align="center"><img src="docs/assets/borges-banner.svg" alt="Borges for KOReader — Your reading travels with you." width="100%"></p>
 
-<p align="center"><strong>Tu lector. Tus subrayados. Una misma biblioteca.</strong><br>Conectá tu lector con Borges y llevá con vos lo que leés.</p>
+<p align="center"><strong>Your reader. Your highlights. One library.</strong><br>Connect KOReader to Borges and keep your reading together.</p>
 
-<p align="center">
-  <a href="https://github.com/totokatz/borges.koplugin/releases/latest/download/borges.koplugin.zip"><img src="docs/assets/download.svg" alt="Descargar plugin para KOReader · ZIP" width="290" height="52"></a>
-  <a href="https://github.com/runadev-arg/crosspoint-toto/releases/download/toto-v1.4.1-toto.1/firmware.bin"><img src="docs/assets/download-crosspoint.svg" alt="Descargar firmware CrossPoint con Borges · Solo Xteink X4" width="290" height="52"></a>
-</p>
-
-<p align="center">
-  <a href="https://github.com/totokatz/borges.koplugin/releases/latest"><img src="https://img.shields.io/github/v/release/totokatz/borges.koplugin?style=flat-square&label=versi%C3%B3n&color=86868b" alt="Última versión"></a>
-  <img src="https://img.shields.io/badge/KOReader-plugin-292929?style=flat-square" alt="Plugin para KOReader">
-  <img src="https://img.shields.io/badge/idiomas-ES%20%2F%20EN-86868b?style=flat-square" alt="Castellano e inglés">
-</p>
-
-<p align="center"><a href="#instalar">Instalación</a> · <a href="https://borges.runadev.com/guia/">Guía visual</a> · <a href="https://borges.runadev.com">Abrir Borges</a> · <a href="docs/README.en.md">English</a></p>
+<p align="center"><a href="https://github.com/totokatz/borges.koplugin/releases/latest/download/borges.koplugin.zip"><strong>↓ Download Borges for KOReader</strong></a><br><br><a href="docs/README.es.md">Castellano</a> · <a href="https://borges.runadev.com/guia/?lang=en">Visual guide</a> · <a href="https://borges.runadev.com">Open Borges</a></p>
 
 ---
 
-## Elegí tu lector
+<p align="center"><a href="https://github.com/totokatz/borges.koplugin/releases/latest/download/borges.koplugin.zip"><img src="docs/assets/download.svg" width="290" alt="Download Borges for KOReader"></a> <a href="https://github.com/runadev-arg/borges-firmware/releases/latest/download/borges-x4.bin"><img src="docs/assets/download-crosspoint.svg" width="290" alt="Download Borges for X4"></a></p>
 
-| Usás… | Descargá | Cómo se instala |
-| :--- | :--- | :--- |
-| **KOReader** en Kobo, Kindle u otro equipo compatible | **[Plugin · ZIP](https://github.com/totokatz/borges.koplugin/releases/latest/download/borges.koplugin.zip)** | Descomprimí y copiá la carpeta. [Paso a paso ↓](#instalar) |
-| **CrossPoint en Xteink X4** | **[Firmware · BIN](https://github.com/runadev-arg/crosspoint-toto/releases/download/toto-v1.4.1-toto.1/firmware.bin)** | Instalá el firmware con la integración incluida. [Guía para X4 →](docs/CROSSPOINT.md) |
+[Install Borges firmware on Xteink X4 →](docs/FIRMWARE.md)
 
-En CrossPoint, Borges viene integrado en el **firmware**: el software del lector. No se instala como un plugin de KOReader. La descarga de CrossPoint corresponde a la versión publicada **1.4.1-toto.1**, donde el menú todavía se llama **Toto Sync**, y es **exclusiva para Xteink X4**.
+## Your reading, connected
 
-## Lo que leés, conectado
+**Choose your download:** [KOReader plugin · ZIP](https://github.com/totokatz/borges.koplugin/releases/latest/download/borges.koplugin.zip) or [Borges firmware · Xteink X4 only](https://github.com/runadev-arg/borges-firmware/releases/latest/download/borges-x4.bin).
 
-| En tu lector | En tu biblioteca |
-| :--- | :--- |
-| **Seguí donde dejaste** | Compartí el progreso entre dispositivos y elegí cuándo retomar la otra posición. |
-| **Guardá lo que te importa** | Sincronizá subrayados, notas y marcadores de la misma edición del libro. |
-| **Conocé tu ritmo** | Reuní sesiones y estadísticas de lectura en Borges. |
-| **Llevate otro libro** | Descargá los EPUB de tu biblioteca desde KOReader. |
-| **Leé sin conexión** | Los cambios quedan pendientes y se envían cuando vuelve la red. |
 
-Las funciones de esta sección corresponden al plugin de KOReader. Necesitás **KOReader instalado**, una **cuenta de [Borges](https://borges.runadev.com)** y conexión a internet para vincular y sincronizar. El plugin funciona dentro de KOReader, no en el lector de fábrica de Kobo o Kindle. La ubicación de KOReader depende del dispositivo y de cómo lo instalaste.
+Sync reading progress, highlights, notes, bookmarks, sessions and statistics with Borges. Download EPUBs from your library, choose when to resume another device's position, and keep reading offline: pending changes are sent when connectivity returns. Annotation sync requires the same book edition.
 
-## Instalar
+You need **KOReader already installed**, a **[Borges account](https://borges.runadev.com)** and internet access to link and sync. This plugin runs inside KOReader, not the stock Kobo or Kindle reader. KOReader's location varies by device and installation method.
 
-### 1. Descargá
+## Install in three steps
 
-Bajá **[borges.koplugin.zip](https://github.com/totokatz/borges.koplugin/releases/latest/download/borges.koplugin.zip)** y descomprimilo en tu computadora.
+1. **Download** [borges.koplugin.zip](https://github.com/totokatz/borges.koplugin/releases/latest/download/borges.koplugin.zip) and unzip it on your computer. Use this link, not **Code → Download ZIP** or GitHub's **Source code** archives.
+2. **Copy** the enclosed `borges.koplugin` folder into your reader's `koreader/plugins/` directory. On Kobo this is usually `.adds/koreader/plugins/`; enable hidden files if necessary.
+3. **Safely eject your reader**, restart KOReader and open **Tools → Borges → Account**. Follow the linking instructions or sign in with your Borges credentials, then choose **Sync now**.
 
-> Usá ese enlace directo. **Code → Download ZIP** y los archivos **Source code** de GitHub descargan el repositorio, no el paquete listo para instalar.
-
-### 2. Copiá
-
-Adentro del ZIP vas a encontrar **`highlightsdetoto.koplugin`**. Copiá esa carpeta completa dentro de **`koreader/plugins/`** de tu lector. En Kobo, normalmente está en **`.adds/koreader/plugins/`**; activá «mostrar archivos ocultos» si no ves `.adds`.
-
-Así tiene que quedar:
+The final layout must be:
 
 ```text
 koreader/
 └── plugins/
-    └── highlightsdetoto.koplugin/
+    └── borges.koplugin/
         ├── _meta.lua
         ├── main.lua
         ├── plugin_version.lua
         └── …
 ```
 
-No copies el ZIP cerrado ni crees una carpeta extra alrededor. **Conservá el nombre de la carpeta:** permite actualizar instalaciones anteriores de Borges. En el menú siempre aparece como **Borges**.
+Do not copy the unopened ZIP or add an extra enclosing folder. The menu name is always **Borges**. [Follow the visual installation guide →](https://borges.runadev.com/guia/?lang=en)
 
-### 3. Conectá
+## Find your way
 
-Expulsá el lector de forma segura, reiniciá KOReader y abrí **Herramientas → Borges → Cuenta**. Vinculá el lector siguiendo las indicaciones de pantalla o entrá con tu usuario y contraseña de Borges. Después elegí **Sincronizar ahora**.
+| Menu | Purpose |
+| :--- | :--- |
+| **Account** | Link your reader, sign in or sign out. |
+| **Sync now** | Send and receive pending changes. |
+| **Library** | Download books and resume reading. |
+| **Status and help** | Check sync status and report a problem. |
+| **Advanced** | Settings and update checks. |
 
-Tu biblioteca está en [borges.runadev.com](https://borges.runadev.com). También podés seguir la **[guía de instalación con imágenes](https://borges.runadev.com/guia/)**.
+Borges follows KOReader's interface language: Spanish when KOReader uses Spanish, English otherwise.
 
-## Un menú, lo necesario
+## Updating an earlier installation
 
-```text
-Borges
-├── Cuenta              Vincular el lector o entrar a tu cuenta
-├── Sincronizar ahora   Enviar y recibir los cambios pendientes
-├── Biblioteca          Descargar libros y retomar la lectura
-├── Estado y ayuda      Ver el estado y reportar un problema
-└── Avanzado            Ajustes y búsqueda de actualizaciones
-```
+Close KOReader. Rename the existing Borges plugin folder to `borges.koplugin` before copying the new files into it. Keep your local configuration files and leave only one copy of the plugin in `plugins/`. Restart KOReader.
 
-El idioma acompaña a KOReader: castellano si su interfaz está en castellano e inglés en los demás casos.
+## Update
 
-## Actualizar
+Open **Borges → Advanced → Check for updates now**. When an update is available, an **Install version…** entry appears in the Borges menu. The updater verifies files and keeps a backup for rollback.
 
-Desde el lector: **Borges → Avanzado → Buscar actualizaciones ahora**. Cuando hay una versión disponible aparece **Instalar la versión…** en el menú de Borges. El actualizador verifica los archivos y conserva una copia para volver atrás.
+For a manual update, close KOReader and copy the new package's contents over the existing plugin folder. Replace plugin files but **keep your local configuration files**; they are not included in the archive. Restart KOReader afterward.
 
-Para actualizar a mano, cerrá KOReader y copiá el contenido del nuevo paquete sobre la carpeta existente, reemplazando los archivos del plugin. **Conservá tus archivos locales de configuración**; el ZIP no los incluye. Reiniciá KOReader al terminar.
+## Troubleshooting
 
-<details>
-<summary><strong>¿Borges no aparece después de instalar?</strong></summary>
+- **Borges is missing:** check that `main.lua` sits directly inside `koreader/plugins/borges.koplugin/`, then fully restart KOReader and check its plugin manager.
+- **You see `borges.koplugin-main`:** you downloaded the source archive. Use the download link above.
+- **Nested folders:** there should be only one `borges.koplugin` folder, not another one inside it.
+- **Download verification:** compare the ZIP's SHA-256 with the [published checksum](https://github.com/totokatz/borges.koplugin/releases/latest/download/borges.koplugin.zip.sha256). Use `Get-FileHash .\borges.koplugin.zip -Algorithm SHA256` on Windows, `shasum -a 256 borges.koplugin.zip` on macOS or `sha256sum -c borges.koplugin.zip.sha256` on Linux.
 
-- Comprobá que `main.lua` esté directamente en `koreader/plugins/highlightsdetoto.koplugin/`.
-- Si ves `borges.koplugin-main`, descargaste el código fuente. Volvé al botón de descarga.
-- Revisá que no haya una segunda carpeta `highlightsdetoto.koplugin` dentro de la primera.
-- Reiniciá KOReader por completo; suspender y despertar el lector no alcanza.
-- Revisá el administrador de plugins de KOReader y habilitá Borges si está desactivado.
+For sync issues, open **Borges → Status and help → Report a problem**. For plugin bugs or compatibility, [open an issue](https://github.com/totokatz/borges.koplugin/issues/new/choose) with your device, KOReader version and Borges version. Do not include passwords, credentials or configuration files.
 
-</details>
-
-<details>
-<summary><strong>Verificar la descarga con SHA-256</strong></summary>
-
-El [archivo de verificación](https://github.com/totokatz/borges.koplugin/releases/latest/download/borges.koplugin.zip.sha256) permite comprobar que el ZIP se descargó completo. Compará su valor con:
-
-```powershell
-# Windows / PowerShell
-Get-FileHash .\borges.koplugin.zip -Algorithm SHA256
-```
-
-```sh
-# macOS
-shasum -a 256 borges.koplugin.zip
-# Linux
-sha256sum -c borges.koplugin.zip.sha256
-```
-
-</details>
-
-## Ayuda y código
-
-Para problemas de sincronización: **Borges → Estado y ayuda → Reportar un problema**. Para errores del plugin o compatibilidad, [abrí un issue](https://github.com/totokatz/borges.koplugin/issues/new/choose) con tu dispositivo, versión de KOReader y versión de Borges. No publiques contraseñas, credenciales ni archivos de configuración.
-
-Este repositorio contiene el plugin. La aplicación web y el servidor se mantienen por separado. Consultá las [notas de versión](highlightsdetoto.koplugin/RELEASE_NOTES.md) y la [guía de publicación](docs/RELEASING.md).
-
----
-
-<p align="center"><img src="docs/assets/borges-mark.svg" alt="Borges" width="40" height="40"><br><sub>Una biblioteca que sigue con vos.</sub></p>
+This repository contains the plugin. The web application and server are maintained separately. See the [release notes](borges.koplugin/RELEASE_NOTES.md) and [publishing guide](docs/RELEASING.md).

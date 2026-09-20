@@ -5,7 +5,7 @@ local SettingsMigration = {
     -- C06 · Servidor oficial por defecto. El paquete se instala genérico: sin
     -- claves, sin URL para tipear y sin nada que el dueño tenga que copiar a
     -- mano. Quien se autohospede la cambia desde el menú.
-    DEFAULT_SERVER_BASE_URL = "https://highlights.runadev.com",
+    DEFAULT_SERVER_BASE_URL = "https://borges.runadev.com",
 }
 
 local CONNECTION_DISCONNECTED = "disconnected"

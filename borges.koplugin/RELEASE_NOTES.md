@@ -8,10 +8,22 @@ release. Una versión sin sección se ofrece igual, sin novedades para mostrar.
 Escribí en criollo y en presente, una línea por cambio, pensando en alguien
 que está por tocar «Actualizar» en un lector de tinta electrónica.
 
+## 2026.09.20.4
+
+- The installation folder is now borges.koplugin. Close KOReader and rename the existing plugin folder before copying this package over it. Keep your configuration files and only one installed copy.
+- The plugin appears as Borges and preserves existing account settings and offline synchronization data.
+
+## 2026.09.20.3
+
+- Borges tiene dirección nueva: borges.runadev.com. Si tu lector ya estaba
+  configurado, no tenés que cambiar nada: la dirección anterior sigue
+  respondiendo para los lectores que la tienen guardada.
+- Un lector recién instalado apunta solo a la dirección nueva.
+
 ## 2026.09.20.2
 
-- El plugin se llama Borges también por dentro: los mensajes de registro que se pegan en un reporte empiezan con «Borges:» y la biblioteca aparece como «Biblioteca Borges» en todas las pantallas.
-- Primera versión publicada en un repositorio abierto, con el ZIP instalable y su SHA-256 en cada release.
+- El aviso de actualización vuelve a aparecer al abrir el menú de Borges cuando hay una versión pendiente.
+- El aviso espera si se cierra el menú durante la consulta y solo se marca como mostrado después de abrirse correctamente.
 
 ## 2026.09.20.1
 

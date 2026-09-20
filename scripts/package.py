@@ -7,7 +7,7 @@ import stat
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
-PLUGIN = "highlightsdetoto.koplugin"
+PLUGIN = "borges.koplugin"
 REQUIRED = {"main.lua", "_meta.lua", "plugin_version.lua", "updater.lua"}
 PRIVATE = {"web_config.json", "dropbox_config.json"}
 

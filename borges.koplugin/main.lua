@@ -25,7 +25,7 @@ local T = require("ffi/util").template
 local Updater = require("updater")
 local main_source = debug.getinfo(1, "S").source
 local boot_plugin_dir = main_source and main_source:match("^@(.+)/main%.lua$")
-    or (DataStorage:getDataDir() .. "/plugins/highlightsdetoto.koplugin")
+    or (DataStorage:getDataDir() .. "/plugins/borges.koplugin")
 Updater.recoverAtLoad(boot_plugin_dir)
 
 local DropboxApi = require("dropboxapi")
@@ -53,7 +53,7 @@ local util = require("util")
 local Screen = Device.screen
 
 local HighlightsDeToto = WidgetContainer:extend{
-    name = "highlightsdetoto",
+    name = "borges",
     is_doc_only = false,
 }
 
@@ -166,7 +166,7 @@ end
 -- ============================================================
 
 function HighlightsDeToto:getPluginDir()
-    return self.path or (DataStorage:getDataDir() .. "/plugins/highlightsdetoto.koplugin")
+    return self.path or (DataStorage:getDataDir() .. "/plugins/borges.koplugin")
 end
 
 function HighlightsDeToto:getConfigFilePath()
@@ -1318,7 +1318,7 @@ function HighlightsDeToto:_syncV2Now(quick, max_pages, force)
     if not self.device_token then
         return nil, WebApi.apiError(
             "device_not_paired",
-            _("This device must finish pairing before Borges Sync v2 can connect."),
+            _("This device must finish pairing before Borges v2 can connect."),
             nil,
             false
         )
@@ -1359,7 +1359,7 @@ function HighlightsDeToto:_drainQueue()
     if self.device_token then
         v2_result, v2_err = self.sync_v2:sync(false, true)
         if v2_err then
-            logger.warn("Borges: Borges Sync v2 drain failed:", tostring(v2_err))
+            logger.warn("Borges: Borges v2 drain failed:", tostring(v2_err))
         end
     end
 
@@ -3621,7 +3621,7 @@ function HighlightsDeToto:getWebAuth()
 end
 
 --- Derive the base URL from the sync URL.
--- e.g., "https://highlights.runadev.com/api/sync" -> "https://highlights.runadev.com"
+-- e.g., "https://borges.runadev.com/api/sync" -> "https://borges.runadev.com"
 function HighlightsDeToto:getBaseUrl()
     if self.server_base_url and self.server_base_url ~= "" then
         return self.server_base_url:gsub("/+$", "")
@@ -3839,8 +3839,10 @@ function HighlightsDeToto:_canAnnouncePluginUpdate(reason)
     }) then
         return false, "already_notified"
     end
+    local menu = self.ui and self.ui.menu and self.ui.menu.menu_container
+    local menu_visible = menu ~= nil and menu[1] ~= nil and not menu[1].not_shown
     return UpdateCheck.isSafeMoment({
-        trigger = reason,
+        trigger = menu_visible and "menu" or (reason == "menu" and "check" or reason),
         book_open = self.book_hash ~= nil,
         resume_dialog = self.resume_flow ~= nil and self.resume_flow:isVisible(),
     })
@@ -3851,11 +3853,6 @@ end
 function HighlightsDeToto:_showPluginUpdateNotice(forced)
     local version = self:getPendingUpdateVersion()
     if not version then return end
-    -- Mostrado cuenta como anunciado: la respuesta vale para esta versión, y
-    -- una reconexión más tarde no vuelve a preguntar lo mismo.
-    self.pending_update_notified = version
-    self:saveSyncState()
-
     local text = T(
         _("There is a new version of Borges.\n\nYou have %1 and %2 is available.\n\nIt is downloaded and installed only if you ask for it."),
         self:getPluginVersion(),
@@ -3873,6 +3870,9 @@ function HighlightsDeToto:_showPluginUpdateNotice(forced)
         end,
         cancel_text = forced and _("Close") or _("Later"),
     })
+    -- Persist only after the widget was shown; rendering errors must allow retry.
+    self.pending_update_notified = version
+    self:saveSyncState()
 end
 
 --- Las novedades, y desde ahí la misma decisión.
@@ -4086,18 +4086,28 @@ end
 -- Menu
 -- ============================================================
 
---- KOReader vuelve a armar el menú cada vez que se abre, así que esto es el
--- hook de "el lector entró al menú". C23 lo usa para dos cosas que sólo
--- tienen sentido acá: preguntar por una versión nueva si hay red, y mostrar
--- el cartel informativo en una pantalla donde no tapa la lectura.
+--- KOReader caches the menu tree; dynamic labels run when entries are displayed.
 function HighlightsDeToto:addToMainMenu(menu_items)
-    menu_items.highlightsdetoto = MenuTree.build(self, { gettext = _, template = T })
-    UIManager:nextTick(function()
-        self:_safecall("menuUpdateCheck", function()
-            self:_maybeCheckPluginUpdate("menu")
-            self:_announcePluginUpdate("menu")
-        end)
-    end)
+    local entry = MenuTree.build(self, { gettext = _, template = T })
+    local label = entry.text
+    entry.text = nil
+    entry.text_func = function()
+        if not self._update_menu_tick_pending then
+            self._update_menu_tick_pending = true
+            UIManager:nextTick(function()
+                self._update_menu_tick_pending = nil
+                -- Labels are also evaluated by menu search and hidden builds.
+                local menu = self.ui and self.ui.menu and self.ui.menu.menu_container
+                if not menu or not menu[1] or menu[1].not_shown then return end
+                self:_safecall("menuUpdateCheck", function()
+                    self:_announcePluginUpdate("menu")
+                    self:_maybeCheckPluginUpdate("menu")
+                end)
+            end)
+        end
+        return label
+    end
+    menu_items.highlightsdetoto = entry
 end
 
 -- ============================================================
@@ -4461,7 +4471,7 @@ end
 
 function HighlightsDeToto:getSupportUrl()
     local base = self:getBaseUrl()
-    if base == "" then return "https://highlights.runadev.com/ayuda" end
+    if base == "" then return "https://borges.runadev.com/ayuda" end
     return base .. "/ayuda"
 end
 
@@ -5542,9 +5552,9 @@ function HighlightsDeToto:configureWebUrl()
     local dialog
     dialog = InputDialog:new{
         title = _("Highlights server"),
-        description = _("The official server is already set. Change it only if you run your own.\nExample: https://highlights.runadev.com"),
+        description = _("The official server is already set. Change it only if you run your own.\nExample: https://borges.runadev.com"),
         input = self:getBaseUrl(),
-        input_hint = "https://highlights.runadev.com",
+        input_hint = "https://borges.runadev.com",
         buttons = {
             {
                 {

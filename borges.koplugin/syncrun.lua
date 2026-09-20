@@ -1,7 +1,7 @@
 -- ============================================================
 -- C07 · Una sola sincronización
 --
--- Antes el menú ofrecía siete formas de sincronizar: "Run Borges Sync v2 now",
+-- Antes el menú ofrecía siete formas de sincronizar: "Run Borges v2 now",
 -- "Sync progress now", "Sync all highlights to web", "Sync current book
 -- highlights", "Pull current book highlights from web", "Sync current book
 -- highlights both ways" y el drenaje escondido dentro de "Sync status". Cada

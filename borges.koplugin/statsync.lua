@@ -195,7 +195,7 @@ local function boundedMetadata(book)
     }
 end
 
---- Build self-contained Borges Sync v2 page-stat payloads.
+--- Build self-contained Borges v2 page-stat payloads.
 -- Chunks obey both the 100-row materializer bound and a conservative byte
 -- ceiling below the protocol's 32 KiB per-event limit.
 function StatSync:getV2Chunks(page_stats, books)

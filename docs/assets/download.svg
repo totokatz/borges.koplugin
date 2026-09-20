@@ -1,8 +1,8 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="290" height="52" viewBox="0 0 290 52" role="img" aria-labelledby="title">
-  <title id="title">Descargar Borges · ZIP para KOReader</title>
+  <title id="title">Download Borges · ZIP para KOReader</title>
   <rect x=".5" y=".5" width="289" height="51" rx="6" fill="#101010" stroke="#292929"/>
   <path d="M26 15v15m-6-6 6 6 6-6m-13 9v4h14v-4" fill="none" stroke="#f0f0ef" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-  <text x="48" y="23" fill="#f0f0ef" font-family="Inter,Arial,Helvetica,sans-serif" font-size="14" font-weight="bold">Descargar Borges</text>
-  <text x="48" y="39" fill="#86868b" font-family="Inter,Arial,Helvetica,sans-serif" font-size="10">ZIP PARA KOREADER</text>
+  <text x="48" y="23" fill="#f0f0ef" font-family="Inter,Arial,Helvetica,sans-serif" font-size="14" font-weight="bold">Download Borges</text>
+  <text x="48" y="39" fill="#86868b" font-family="Inter,Arial,Helvetica,sans-serif" font-size="10">KOREADER PLUGIN · ZIP</text>
   <path d="m262 22 4 4-4 4" fill="none" stroke="#f0f0ef" stroke-width="2"/>
 </svg>

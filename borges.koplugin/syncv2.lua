@@ -77,7 +77,7 @@ function SyncV2:pull(quick, focus_book, focus_only)
     if response.protocol_version ~= 2 then
         local protocol_err = self.web_api.apiError(
             "unsupported_protocol_response",
-            "Server did not return Borges Sync v2.",
+            "Server did not return Borges v2.",
             nil,
             false,
             response.request_id
@@ -188,7 +188,7 @@ function SyncV2:sync(force, quick)
     if response.protocol_version ~= 2 then
         local protocol_err = self.web_api.apiError(
             "unsupported_protocol_response",
-            "Server did not return Borges Sync v2.",
+            "Server did not return Borges v2.",
             nil,
             false,
             response.request_id
