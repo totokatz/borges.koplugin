@@ -4,7 +4,7 @@
 
 <p align="center">
   <a href="https://github.com/totokatz/borges.koplugin/releases/latest/download/borges.koplugin.zip"><img src="assets/download.svg" alt="Descargar plugin para KOReader · ZIP" width="290" height="52"></a>
-  <a href="https://github.com/runadev-arg/borges-firmware/releases/latest/download/borges-x4.bin"><img src="assets/download-crosspoint.svg" alt="Descargar firmware Borges · Solo Xteink X4" width="290" height="52"></a>
+  <a href="https://github.com/runadev-arg/borges-firmware/releases/latest/download/borges-x4.bin"><img src="assets/download-firmware.svg" alt="Descargar firmware Borges · Solo Xteink X4" width="290" height="52"></a>
 </p>
 
 <p align="center">
@@ -60,7 +60,7 @@ koreader/
         └── …
 ```
 
-No copies el ZIP cerrado ni crees una carpeta extra alrededor. **Conservá el nombre de la carpeta:** permite actualizar instalaciones anteriores de Borges. En el menú siempre aparece como **Borges**.
+No copies el ZIP cerrado ni crees una carpeta extra alrededor. **Usá el nombre borges.koplugin:** si actualizás una instalación anterior, renombrá primero su carpeta y conservá tus archivos de configuración. En el menú siempre aparece como **Borges**.
 
 ### 3. Conectá
 

@@ -6,7 +6,7 @@
 
 ---
 
-<p align="center"><a href="https://github.com/totokatz/borges.koplugin/releases/latest/download/borges.koplugin.zip"><img src="docs/assets/download.svg" width="290" alt="Download Borges for KOReader"></a> <a href="https://github.com/runadev-arg/borges-firmware/releases/latest/download/borges-x4.bin"><img src="docs/assets/download-crosspoint.svg" width="290" alt="Download Borges for X4"></a></p>
+<p align="center"><a href="https://github.com/totokatz/borges.koplugin/releases/latest/download/borges.koplugin.zip"><img src="docs/assets/download.svg" width="290" alt="Download Borges for KOReader"></a> <a href="https://github.com/runadev-arg/borges-firmware/releases/latest/download/borges-x4.bin"><img src="docs/assets/download-firmware.svg" width="290" alt="Download Borges for X4"></a></p>
 
 [Install Borges firmware on Xteink X4 →](docs/FIRMWARE.md)
 
