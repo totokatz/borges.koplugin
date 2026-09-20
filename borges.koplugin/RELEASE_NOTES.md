@@ -8,6 +8,11 @@ release. Una versión sin sección se ofrece igual, sin novedades para mostrar.
 Escribí en criollo y en presente, una línea por cambio, pensando en alguien
 que está por tocar «Actualizar» en un lector de tinta electrónica.
 
+## 2026.09.20.5
+
+- Use the Borges installation folder and English package guide.
+- Keep setup instructions applicable to every reader running KOReader.
+
 ## 2026.09.20.4
 
 - The installation folder is now borges.koplugin. Close KOReader and rename the existing plugin folder before copying this package over it. Keep your configuration files and only one installed copy.

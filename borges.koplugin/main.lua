@@ -5171,7 +5171,7 @@ function HighlightsDeToto:showConfigFileInfo()
     local config_path = self:getConfigFilePath()
     self:saveConfigFile()
     self:showInfo(
-        T(_("You can edit Dropbox settings from your PC!\n\nConnect your Kobo via USB and edit:\n\n%1\n\nThe file contains:\n- app_key\n- refresh_token\n- dropbox_path\n\nThe plugin will read it on next startup."), config_path),
+        T(_("You can edit Dropbox settings from your PC!\n\nConnect your reader via USB and edit:\n\n%1\n\nThe file contains:\n- app_key\n- refresh_token\n- dropbox_path\n\nThe plugin will read it on next startup."), config_path),
         30
     )
 end

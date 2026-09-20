@@ -377,7 +377,7 @@ return {
     ["You are back on p. %1."] = "Volviste a la pág. %1.",
     ["You are on p. %1. You can go back to where you were from the menu."] = "Estás en la pág. %1. Podés volver a donde estabas desde el menú.",
     ["You are signing in as %1, but %2 still has %3 change(s) waiting to upload.\n\nThose changes belong to %2 and cannot be sent to another account."] = "Estás entrando como %1, pero %2 todavía tiene %3 cambio(s) esperando para enviarse.\n\nEsos cambios son de %2 y no se pueden mandar a otra cuenta.",
-    ["You can edit Dropbox settings from your PC!\n\nConnect your Kobo via USB and edit:\n\n%1\n\nThe file contains:\n- app_key\n- refresh_token\n- dropbox_path\n\nThe plugin will read it on next startup."] = "¡Podés editar la configuración de Dropbox desde tu PC!\n\nConectá el Kobo por USB y editá:\n\n%1\n\nEl archivo contiene:\n- app_key\n- refresh_token\n- dropbox_path\n\nEl plugin lo lee en el próximo arranque.",
+    ["You can edit Dropbox settings from your PC!\n\nConnect your reader via USB and edit:\n\n%1\n\nThe file contains:\n- app_key\n- refresh_token\n- dropbox_path\n\nThe plugin will read it on next startup."] = "¡Podés editar la configuración de Dropbox desde tu PC!\n\nConectá el lector por USB y editá:\n\n%1\n\nEl archivo contiene:\n- app_key\n- refresh_token\n- dropbox_path\n\nEl plugin lo lee en el próximo arranque.",
     ["You have not synced on this reader yet."] = "Todavía no sincronizaste en este lector.",
     ["You switched books, so nothing was moved."] = "Cambiaste de libro, así que no moví nada.",
     ["your account"] = "tu cuenta",
