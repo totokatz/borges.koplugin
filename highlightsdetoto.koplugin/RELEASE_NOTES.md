@@ -8,6 +8,11 @@ release. Una versión sin sección se ofrece igual, sin novedades para mostrar.
 Escribí en criollo y en presente, una línea por cambio, pensando en alguien
 que está por tocar «Actualizar» en un lector de tinta electrónica.
 
+## 2026.09.20.2
+
+- El plugin se llama Borges también por dentro: los mensajes de registro que se pegan en un reporte empiezan con «Borges:» y la biblioteca aparece como «Biblioteca Borges» en todas las pantallas.
+- Primera versión publicada en un repositorio abierto, con el ZIP instalable y su SHA-256 en cada release.
+
 ## 2026.09.20.1
 
 - Borges habla el idioma de tu KOReader. Con KOReader en castellano todo sigue igual; en cualquier otro idioma el plugin aparece entero en inglés, menús, avisos y mensajes de error incluidos.
