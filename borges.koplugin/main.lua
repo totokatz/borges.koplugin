@@ -1010,6 +1010,29 @@ function HighlightsDeToto:_safecall(label, fn)
     return ok
 end
 
+--- C31 · Una pregunta del menú falló mientras KOReader lo dibujaba.
+--
+-- MenuTree ya devolvió el respaldo (etiqueta fija, ítem apagado), así que el
+-- menú sigue abierto. Acá queda el rastro en el log y, una sola vez por punto
+-- y por sesión, un aviso que la persona puede fotografiar y mandar por
+-- «Reportar un problema». Se muestra en el tick siguiente para no meter un
+-- widget encima del menú a medio armar. Sin T(): si lo que falló es la
+-- plantilla, este aviso tiene que salir igual.
+function HighlightsDeToto:reportMenuError(what, err)
+    local detail = tostring(err)
+    logger.err("Borges: menu", tostring(what), "failed:", detail)
+    self._menu_errors_shown = self._menu_errors_shown or {}
+    if self._menu_errors_shown[what] then return end
+    self._menu_errors_shown[what] = true
+    if #detail > 700 then detail = detail:sub(1, 700) .. "…" end
+    local text = _("Part of the Borges menu could not be drawn (%1).\nThe rest keeps working. Please report this problem and include this text:\n\n%2")
+    text = text:gsub("%%1", function() return tostring(what) end)
+    text = text:gsub("%%2", function() return detail end)
+    UIManager:nextTick(function()
+        UIManager:show(InfoMessage:new{ text = text })
+    end)
+end
+
 --- One automatic operation at a time; pending triggers are coalesced by kind.
 -- All settings, queue commits and widget work stay in this parent process.
 function HighlightsDeToto:_runBackgroundSync(label, fn)
@@ -2410,9 +2433,13 @@ function HighlightsDeToto:_navigateToProgress(server_data, same_device)
 
     -- For reflowable docs (EPUB): prefer xpointer (device-independent)
     if not self.has_pages and server_data.xpointer and server_data.xpointer ~= "" then
-        self.ui:handleEvent(Event:new("GotoXPointer", server_data.xpointer))
-        logger.info("Borges: Navigated via xpointer")
-        return true
+        -- onGotoXPointer does not check it: one not in this DOM would move nowhere and still be saved.
+        if self:_isValidXPointer(server_data.xpointer) then
+            self.ui:handleEvent(Event:new("GotoXPointer", server_data.xpointer))
+            logger.info("Borges: Navigated via xpointer")
+            return true
+        end
+        logger.warn("Borges: xpointer not in this document, using percentage:", server_data.xpointer)
     end
 
     -- For paged docs (PDF/DJVU) on same device: use page number directly

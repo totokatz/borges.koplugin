@@ -8,6 +8,16 @@ release. Una versión sin sección se ofrece igual, sin novedades para mostrar.
 Escribí en criollo y en presente, una línea por cambio, pensando en alguien
 que está por tocar «Actualizar» en un lector de tinta electrónica.
 
+## 2026.11.05.1
+
+- A position saved from another edition of the book, or from another reader, no longer leaves you where you were and overwrites your place. If it does not exist in this copy, the book opens at the same percentage instead.
+
+## 2026.09.21.1
+
+- The Library, Status and help, and Advanced menus no longer close KOReader on Android. If one entry cannot be read, it shows a plain label and stays off instead of taking the whole app down.
+- When that happens, a notice shows what failed so it can be sent through Report a problem.
+- The separators inside those menus are drawn as lines again, not as empty rows.
+
 ## 2026.09.20.5
 
 - Use the Borges installation folder and English package guide.
