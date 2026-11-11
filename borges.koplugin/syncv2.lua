@@ -115,7 +115,9 @@ function SyncV2:pull(quick, focus_book, focus_only)
         local event = (response.pull or response).focus_event
         if type(event) == "table" and self.apply_event then
             local action = self.apply_event(event)
-            if action == true then self.queue:removeInboxEvent(event.event_id) end
+            if action == true then self.queue:removeInboxEvent(event.event_id, true) end
+            -- Lo que `apply_event` dejo pendiente sale aca, en un guardado.
+            self.queue:flush("consume")
         end
     end
     committed.sent = 0
@@ -223,7 +225,15 @@ function SyncV2:syncAll(force, max_pages, quick)
         pending = self.queue:v2Count(),
         cursor = self.queue:getCursor(),
     }
+    local more_to_read = false
     for page = 1, max_pages do
+        -- Lo que queda en el outbox no puede salir (una posicion retenida, un
+        -- reintento que todavia espera) y el servidor no dijo que tuviera mas:
+        -- otra vuelta seria un pedido entero para no mover nada.
+        if page > 1 and not more_to_read and self.queue.sendableCount
+            and self.queue:sendableCount(force) == 0 then
+            break
+        end
         -- A manual sync retries the entire saved backlog, including later pages
         -- whose backoff was set by earlier failures.
         local result, err = self:sync(force, quick)
@@ -234,6 +244,7 @@ function SyncV2:syncAll(force, max_pages, quick)
         summary.deferred = summary.deferred + (result.deferred or 0)
         summary.pending = result.pending
         summary.cursor = result.cursor
+        more_to_read = result.has_more == true
         if not result.has_more and result.pending == 0 then break end
         if (result.sent or 0) == 0 and result.pending > 0 then break end
     end

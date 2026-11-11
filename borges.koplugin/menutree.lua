@@ -233,6 +233,17 @@ function MenuTree.build(plugin, deps)
                 separator = true,
             },
             {
+                -- Solo donde se puede (Kobo). Apagado por defecto.
+                text_func = label("avanzado.wifi", _("Turn Wi-Fi off after syncing (saves battery)"), function()
+                    return plugin:getWifiOnlyToSyncLabel()
+                end),
+                help_text = _("Borges turns Wi-Fi on when you wake the reader to check your last reading. With this on, it connects in the background without any notice, turns Wi-Fi off again as soon as syncing is done so the reader can rest between pages, and turns it on for a moment when you put the reader to sleep to upload your reading. The network has to be one the reader itself remembers. Wi-Fi you turn on yourself is never touched."),
+                show_func = shown("avanzado.wifi", function() return plugin:canCloseWifiAfterSync() end),
+                checked_func = checked("avanzado.wifi", function() return plugin:isWifiOnlyToSyncEnabled() end),
+                callback = action("avanzado.wifi", function() plugin:toggleWifiOnlyToSync() end),
+                separator = true,
+            },
+            {
                 text = _("Resend all reading statistics"),
                 keep_menu_open = true,
                 enabled_func = enabled("avanzado.stats", function() return plugin:hasAccountAccess() end),

@@ -210,6 +210,15 @@ local function preserve(path, content)
     write(backup, content)
 end
 
+--- Copia exacta de un archivo de la cola, una sola vez: si la copia ya existe
+-- no se pisa. Es la red de seguridad antes de cambiar la forma del estado.
+function Storage.snapshot(path, suffix)
+    local content = read(path)
+    if not content or read(path .. suffix) ~= nil then return false end
+    write(path .. suffix, content)
+    return true
+end
+
 function Storage.open(path)
     local LuaSettings = require("luasettings")
     local primary, previous = read(path), read(path .. ".old")

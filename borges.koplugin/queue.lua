@@ -1,4 +1,18 @@
 --- Durable Borges v2 outbox/inbox plus a lossless legacy compatibility queue.
+--
+-- El estado vive en tres clases de archivo, separadas por cada cuanto cambian:
+--
+--   highlightsdetoto_sync_v2.lua            lo que cambia leyendo: outbox, cursor,
+--                                           secuencia, decisiones. Unos pocos KB.
+--   highlightsdetoto_sync_v2/inbox.lua      lo que llego de otros lectores y espera
+--                                           a que se abra su libro. Puede pesar
+--                                           cientos de KB y casi nunca cambia.
+--   highlightsdetoto_sync_v2/book-<md5>.lua lo ya sincronizado de UN libro.
+--
+-- Antes todo iba junto y cada guardado reescribia el archivo entero: guardar la
+-- posicion de lectura reescribia tambien las anotaciones pendientes de un libro
+-- que nadie habia abierto en dos meses. Medido en un lector real: 426 KB por
+-- guardado, y un guardado por cada subrayado nuevo.
 
 local QueueStorage = require("queuestorage")
 local rapidjson = require("rapidjson")
@@ -8,11 +22,18 @@ local logger = require("logger")
 local Queue = {}
 Queue.__index = Queue
 
-local STATE_VERSION = 2
+local STATE_VERSION = 3
+local INBOX_FORMAT = "borges-inbox-1"
+local ANNOTATION_FORMAT = "borges-annotations-1"
+local SHARD_DIR = "highlightsdetoto_sync_v2"
 local DEFAULT_MAX_EVENTS = 20
 local DEFAULT_MAX_BYTES = 240 * 1024
 local MAX_REJECTED = 50
-local MAX_INBOX = 500
+-- Tope de lo que espera a su libro. Con una sola entrada por anotacion (ver
+-- `inboxSlot`) el numero es "anotaciones ajenas distintas en libros sin abrir".
+-- Era 500 y al pasarlo se tiraba el evento mas viejo en silencio mientras el
+-- cursor avanzaba igual: un libro con 839 subrayados perdia 339.
+local MAX_INBOX = 2000
 local MAX_BACKOFF = 6 * 60 * 60
 
 local function progressKey(identifier)
@@ -43,7 +64,72 @@ end
 
 local function boundedAppend(items, item, limit)
     table.insert(items, item)
-    while #items > limit do table.remove(items, 1) end
+    local dropped = 0
+    while #items > limit do table.remove(items, 1); dropped = dropped + 1 end
+    return dropped
+end
+
+--- Una anotacion o un marcador viajan enteros en cada evento: el mas nuevo
+-- reemplaza a cualquier otro pendiente de la misma anotacion del mismo libro
+-- (un borrado tambien). Guardar los dos era la mitad del inbox de un lector
+-- real: 34 anotaciones, 68 eventos.
+local function inboxSlot(event)
+    local kind = type(event) == "table" and event.event_type
+    if type(kind) ~= "string" or type(event.aggregate_id) ~= "string" then return nil end
+    if kind:sub(1, 11) ~= "annotation." and kind:sub(1, 9) ~= "bookmark." then return nil end
+    -- Una rama que el servidor guardo como conflicto no es el estado vigente:
+    -- ni reemplaza a nadie ni se aplica (ver `_applySyncV2Event`).
+    if event.directive == "annotation_conflict" then return nil end
+    local metadata = event.directive_metadata
+    if type(metadata) == "table" and metadata.annotation_conflict == true then return nil end
+    local identifier = event.book_identifier
+    if type(identifier) ~= "table" or not identifier.kind or not identifier.value then return nil end
+    return identifier.kind .. ":" .. identifier.value .. "|" .. event.aggregate_id
+end
+
+--- Orden del servidor sin perder precision: las secuencias son enteros que
+-- pueden no entrar en un numero de Lua. Sin secuencia en alguno, manda el
+-- orden de llegada (lo que llega despues es mas nuevo).
+local function arrivedBefore(candidate, existing)
+    local a, b = tostring(candidate.server_sequence or ""), tostring(existing.server_sequence or "")
+    if not a:match("^%d+$") or not b:match("^%d+$") then return false end
+    if #a ~= #b then return #a < #b end
+    return a < b
+end
+
+--- Agregar al inbox dejando una sola entrada por anotacion. Devuelve cuantos
+-- eventos hubo que tirar por el tope (0 casi siempre).
+local function appendInbox(inbox, event)
+    local slot = inboxSlot(event)
+    if slot then
+        for index = #inbox, 1, -1 do
+            if inboxSlot(inbox[index]) == slot then
+                if arrivedBefore(event, inbox[index]) then return 0 end
+                table.remove(inbox, index)
+            end
+        end
+    end
+    return boundedAppend(inbox, event, MAX_INBOX)
+end
+
+--- Lo mismo para un inbox que ya estaba guardado con repetidos.
+local function compactInbox(events)
+    local newest, removed = {}, 0
+    for index, event in ipairs(events) do
+        local slot = inboxSlot(event)
+        if slot then
+            local previous = newest[slot]
+            if previous == nil or not arrivedBefore(event, events[previous]) then newest[slot] = index end
+        end
+    end
+    for index = #events, 1, -1 do
+        local slot = inboxSlot(events[index])
+        if slot and newest[slot] ~= index then
+            table.remove(events, index)
+            removed = removed + 1
+        end
+    end
+    return removed
 end
 
 local function findById(items, id)
@@ -71,10 +157,14 @@ local function normalizeState(value)
         state.next_client_sequence = math.max(state.next_client_sequence,
             (tonumber(event.client_sequence) or 0) + 1)
     end
-    state.inbox = type(state.inbox) == "table" and state.inbox or {}
+    -- `inbox` y `annotation_state` ya no viven aca. Si aparecen es un estado
+    -- anterior a la separacion (o uno que toco una version vieja del plugin):
+    -- se dejan como estan para que `_adoptLegacyLayout` los mude sin perder nada.
     state.rejected = type(state.rejected) == "table" and state.rejected or {}
-    state.annotation_state = type(state.annotation_state) == "table"
-        and state.annotation_state or {}
+    -- Generacion de los archivos separados. Cortar la cuenta la incrementa en
+    -- el estado principal, y con eso todo archivo de la generacion anterior
+    -- deja de valer en un solo guardado atomico, sin recorrer la carpeta.
+    state.shard_epoch = math.max(1, math.floor(tonumber(state.shard_epoch) or 1))
     -- C17 · Lo que el lector ya respondió sobre la posición de otro aparato.
     -- Vive acá y no en memoria porque un "seguir aquí" tiene que sobrevivir a
     -- una reconexión y a un reinicio; y vive junto al cursor porque pertenece
@@ -86,25 +176,337 @@ local function normalizeState(value)
     return state
 end
 
+-- -------------------------------------------------------------------------
+-- Archivos separados ("shards")
+-- -------------------------------------------------------------------------
+
+--- Un archivo por nombre dentro de la carpeta de la cola, con la misma
+-- escritura verificada y atomica que el estado principal.
+local function fileShards(settings_dir)
+    local dir = settings_dir .. "/" .. SHARD_DIR
+    local opened, ready = {}, false
+    local function exists()
+        return require("libs/libkoreader-lfs").attributes(dir, "mode") ~= nil
+    end
+    local function open(name)
+        opened[name] = opened[name] or QueueStorage.open(dir .. "/" .. name .. ".lua")
+        return opened[name]
+    end
+    return {
+        read = function(name)
+            -- Leer no crea la carpeta: sin nada que guardar no queda rastro.
+            if not opened[name] and not exists() then return nil end
+            return open(name):readSetting("state")
+        end,
+        write = function(name, value)
+            if not ready then
+                local lfs = require("libs/libkoreader-lfs")
+                local mode = lfs.attributes(dir, "mode")
+                if mode == nil then
+                    assert(lfs.mkdir(dir), "Cannot create queue directory: " .. dir)
+                    -- La carpeta nueva tambien tiene que sobrevivir a un corte:
+                    -- su entrada vive en la carpeta de ajustes, que es la que
+                    -- hay que sincronizar (fsyncDirectory de una carpeta
+                    -- sincroniza esa carpeta, no a su padre).
+                    require("ffi/util").fsyncDirectory(settings_dir)
+                else
+                    assert(mode == "directory", "Queue path is not a directory: " .. dir)
+                end
+                ready = true
+            end
+            local store = open(name)
+            store:saveSetting("state", value)
+            store:flush()
+        end,
+    }
+end
+
+--- Cuando quien llama trae su propia store (las pruebas), los archivos
+-- separados viven en esa misma store bajo otra clave: mismo recorrido de
+-- codigo, sin tocar el disco.
+local function embeddedShards(store)
+    return {
+        read = function(name) return store:readSetting("shard:" .. name) end,
+        write = function(name, value)
+            store:saveSetting("shard:" .. name, value)
+            store:flush()
+        end,
+    }
+end
+
+local function bookShardName(book_hash)
+    -- El md5 parcial ya es un nombre de archivo valido. Cualquier otra cosa se
+    -- reduce a su md5 para no escribir nunca un nombre que el disco rechace.
+    if book_hash:match("^[%w_%-]+$") and #book_hash <= 64 then return "book-" .. book_hash end
+    return "book-x" .. require("ffi/sha2").md5(book_hash)
+end
+
+--- Una entrada del mapa de anotaciones ocupa seis lineas como tabla y una como
+-- texto. Es el archivo que se reescribe en cada subrayado, asi que el tamano
+-- importa. Solo se compacta la forma conocida; cualquier otra viaja intacta.
+local ENTRY_FIELDS = { fingerprint = true, kind = true, revision = true, present = true }
+local function encodeEntry(entry)
+    if type(entry) ~= "table" then return entry end
+    for key in pairs(entry) do
+        if not ENTRY_FIELDS[key] then return entry end
+    end
+    local fingerprint, kind, revision = entry.fingerprint, entry.kind, entry.revision
+    if (fingerprint ~= nil and (type(fingerprint) ~= "string" or fingerprint:find("|", 1, true)))
+        or (kind ~= nil and (type(kind) ~= "string" or kind == "" or kind:find("|", 1, true)))
+        or (revision ~= nil and (type(revision) ~= "string" or not revision:match("^%d+$")))
+        or (entry.present ~= nil and type(entry.present) ~= "boolean") then
+        return entry
+    end
+    local present = entry.present == true and "1" or entry.present == false and "0" or ""
+    return table.concat({ "1", kind or "", present, revision or "", fingerprint or "" }, "|")
+end
+
+local function decodeEntry(stored)
+    if type(stored) ~= "string" then return stored end
+    local kind, present, revision, fingerprint = stored:match("^1|([^|]*)|([01]?)|(%d*)|([^|]*)$")
+    -- Una huella suelta (formato anterior a las revisiones) no empieza con
+    -- "1|": se devuelve tal cual y `AnnotationAdapter:diff` ya sabe leerla.
+    if not kind then return stored end
+    local entry = {}
+    if kind ~= "" then entry.kind = kind end
+    if present ~= "" then entry.present = present == "1" end
+    if revision ~= "" then entry.revision = revision end
+    if fingerprint ~= "" then entry.fingerprint = fingerprint end
+    return entry
+end
+
+local function sameAnnotationState(left, right)
+    for id, a in pairs(left) do
+        local b = right[id]
+        if type(a) ~= type(b) then return false end
+        if type(a) == "table" then
+            for key, value in pairs(a) do if b[key] ~= value then return false end end
+            for key in pairs(b) do if a[key] == nil then return false end end
+        elseif a ~= b then
+            return false
+        end
+    end
+    for id in pairs(right) do if left[id] == nil then return false end end
+    return true
+end
+
+local function inboxIndex(events)
+    local books, total = {}, 0
+    for _, event in ipairs(events) do
+        total = total + 1
+        local key = progressKey(event.book_identifier) or "?"
+        books[key] = (books[key] or 0) + 1
+    end
+    return { total = total, books = books }
+end
+
+local function sameIndex(left, right)
+    if type(left) ~= "table" or type(left.books) ~= "table" or left.total ~= right.total then return false end
+    for key, count in pairs(right.books) do if left.books[key] ~= count then return false end end
+    for key in pairs(left.books) do if right.books[key] == nil then return false end end
+    return true
+end
+
 function Queue:new(settings_dir, options)
     options = options or {}
     local path = settings_dir .. "/highlightsdetoto_sync_v2.lua"
     local legacy_path = settings_dir .. "/highlightsdetoto_queue.lua"
+    local store = options.store or QueueStorage.open(path)
     local instance = setmetatable({
         path = path,
-        store = options.store or QueueStorage.open(path),
+        store = store,
         legacy_store = options.legacy_store or QueueStorage.open(legacy_path),
+        shards = options.shards
+            or (options.store and embeddedShards(store) or fileShards(settings_dir)),
         now = options.now or os.time,
         uuid = options.uuid or function() return random.uuid(true):lower() end,
+        _books = {},
+        _dirty = { main = true, inbox = false, books = {} },
     }, self)
-    instance.state = normalizeState(instance.store:readSetting("state"))
-    instance:_save()
+    instance.state = normalizeState(store:readSetting("state"))
+    instance:_adoptLegacyLayout(not options.store and function()
+        -- El archivo unico de antes queda guardado tal cual, una sola vez.
+        QueueStorage.snapshot(path, ".pre-split")
+    end or nil)
+    if type(instance.state.inbox_index) ~= "table" then instance:_inbox() end
+    instance:flush()
     return instance
 end
 
-function Queue:_save()
-    self.store:saveSetting("state", self.state)
-    self.store:flush()
+--- ¿Este archivo separado pertenece al estado principal que esta cargado?
+-- La generacion corta todo de una vez; la cuenta cubre el caso de un plugin
+-- viejo que haya cambiado de cuenta sin saber que la generacion existe. Un
+-- archivo sin cuenta anotada es de una cola anterior a C06 y lo adopta quien
+-- esta, igual que el resto de esa cola.
+function Queue:_shardIsCurrent(stored)
+    return type(stored) == "table"
+        and stored.epoch == self.state.shard_epoch
+        and (stored.account_scope == nil or stored.account_scope == self.state.account_scope)
+end
+
+--- El inbox se lee recien cuando alguien lo necesita. Con el indice del estado
+-- principal, arrancar KOReader o abrir un libro sin nada pendiente no parsea
+-- cientos de KB de anotaciones ajenas.
+function Queue:_inbox()
+    if self._inbox_events then return self._inbox_events end
+    local stored = self.shards.read("inbox")
+    local events = {}
+    if self:_shardIsCurrent(stored) and type(stored.events) == "table" then
+        events = stored.events
+    end
+    self._inbox_events = events
+    -- Sale con el proximo guardado: leer no escribe.
+    if compactInbox(events) > 0 then self._dirty.inbox = true end
+    self:_reindexInbox()
+    return events
+end
+
+--- El indice es una pista, nunca la verdad: se recalcula cada vez que el inbox
+-- se lee o cambia, asi que una pista vieja se corrige sola.
+function Queue:_reindexInbox()
+    local index = inboxIndex(self._inbox_events)
+    if not sameIndex(self.state.inbox_index, index) then
+        self.state.inbox_index = index
+        self._dirty.main = true
+    end
+end
+
+--- Tirar algo recibido nunca es silencioso: queda contado en el estado y en
+-- el log, que es lo que se manda con «Reportar un problema».
+function Queue:_noteInboxOverflow(dropped)
+    if not dropped or dropped <= 0 then return end
+    self.state.inbox_dropped = (tonumber(self.state.inbox_dropped) or 0) + dropped
+    self._dirty.main = true
+    logger.warn("Borges: inbox full, dropped", dropped, "oldest pending events; total", self.state.inbox_dropped)
+end
+
+function Queue:inboxDroppedCount()
+    return tonumber(self.state.inbox_dropped) or 0
+end
+
+function Queue:_inboxChanged()
+    self._dirty.inbox = true
+    self:_reindexInbox()
+end
+
+function Queue:_book(book_hash)
+    local cached = self._books[book_hash]
+    if cached ~= nil then return cached or nil end
+    local stored = self.shards.read(bookShardName(book_hash))
+    local items = false
+    if self:_shardIsCurrent(stored) and type(stored.items) == "table" then
+        items = {}
+        for id, entry in pairs(stored.items) do items[id] = decodeEntry(entry) end
+    end
+    self._books[book_hash] = items
+    return items or nil
+end
+
+--- Mudar un estado de archivo unico a los archivos separados, sin perder nada.
+--
+-- Lo separado se escribe y se confirma ANTES de sacarlo del estado principal.
+-- Si la corriente se corta en el medio, el principal todavia lo tiene todo y el
+-- proximo arranque repite la mudanza desde ahi, con el mismo resultado.
+--
+-- Tambien cubre el camino de vuelta: una version vieja del plugin que corra
+-- sobre este estado vuelve a crear `inbox` y `annotation_state` y sigue
+-- trabajando ahi. Al actualizar otra vez eso se suma a lo que ya estaba
+-- separado, no lo pisa.
+function Queue:_adoptLegacyLayout(preserve)
+    local state = self.state
+    local legacy_inbox, legacy_books = state.inbox, state.annotation_state
+    if legacy_inbox == nil and legacy_books == nil then return false end
+    if preserve then preserve() end
+
+    if type(legacy_inbox) == "table" and #legacy_inbox > 0 then
+        local events = self:_inbox()
+        for _, event in ipairs(legacy_inbox) do
+            if event.event_id == nil or not findById(events, event.event_id) then
+                self:_noteInboxOverflow(appendInbox(events, event))
+            end
+        end
+        self:_inboxChanged()
+    end
+    if type(legacy_books) == "table" then
+        for book_hash, items in pairs(legacy_books) do
+            -- Lo que anoto la version vieja de un libro es mas nuevo que lo
+            -- separado antes para ese mismo libro. Un mapa vacio no dice nada.
+            if type(book_hash) == "string" and book_hash ~= ""
+                and type(items) == "table" and next(items) ~= nil then
+                self._books[book_hash] = items
+                self._dirty.books[book_hash] = true
+            end
+        end
+    end
+    state.inbox, state.annotation_state = nil, nil
+    self._dirty.main = true
+    self:flush("consume") -- libros, inbox y recien despues el principal sin ellos
+    return true
+end
+
+--- Escribir lo que cambio, y solo eso.
+--
+-- El orden importa porque son varios archivos y la corriente se puede cortar
+-- entre dos:
+--   * "produce" (por defecto): inbox, principal, libros. Un subrayado nuevo
+--     entra al outbox ANTES de anotarse como sincronizado. Al reves, un corte
+--     lo dejaria anotado y sin mandar: se perderia para siempre.
+--   * "consume": libros, inbox, principal. Lo recibido queda aplicado ANTES de
+--     mover el cursor. Al reves, un corte dejaria el cursor adelantado sobre
+--     algo que nunca se guardo.
+-- En los dos casos lo peor que deja un corte es trabajo repetido, que el
+-- servidor y el lector ya saben reconocer; nunca trabajo perdido.
+function Queue:flush(order)
+    local dirty = self._dirty
+    if not (dirty.main or dirty.inbox or next(dirty.books)) then return false end
+    -- Quien use la cola puede necesitar guardar algo propio antes (el plugin
+    -- guarda las anotaciones del libro): si esto falla, la cola no avanza.
+    if self.before_flush then self.before_flush() end
+    local function books()
+        for book_hash in pairs(dirty.books) do
+            local items = {}
+            for id, entry in pairs(self._books[book_hash] or {}) do items[id] = encodeEntry(entry) end
+            self.shards.write(bookShardName(book_hash), {
+                format = ANNOTATION_FORMAT,
+                epoch = self.state.shard_epoch,
+                account_scope = self.state.account_scope,
+                book_hash = book_hash,
+                items = items,
+            })
+            dirty.books[book_hash] = nil
+        end
+    end
+    local function inbox()
+        if not dirty.inbox then return end
+        self.shards.write("inbox", {
+            format = INBOX_FORMAT,
+            epoch = self.state.shard_epoch,
+            account_scope = self.state.account_scope,
+            events = self._inbox_events or {},
+        })
+        dirty.inbox = false
+    end
+    local function main()
+        if not dirty.main then return end
+        self.store:saveSetting("state", self.state)
+        self.store:flush()
+        dirty.main = false
+    end
+    if order == "consume" then
+        books(); inbox(); main()
+    else
+        inbox(); main(); books()
+    end
+    return true
+end
+
+--- Marcar el estado principal como cambiado. Con `defer` no se escribe ahora:
+-- queda para el proximo `flush`, que es como se agrupan varios cambios en un
+-- solo guardado. No hay un "modo diferido" que alguien pueda dejar prendido:
+-- lo pendiente sale con el siguiente guardado de cualquier cosa.
+function Queue:_save(defer)
+    self._dirty.main = true
+    if not defer then self:flush() end
 end
 
 function Queue:getInstallId()
@@ -115,11 +517,16 @@ function Queue:getCursor()
     return self.state.applied_cursor
 end
 
+-- Retener y soltar la posicion no escriben por si solos: viajan con el
+-- proximo guardado, que es el del propio evento de posicion (mismo archivo,
+-- una sola escritura atomica). Un corte antes de eso no pierde nada: al
+-- arrancar, `holdPendingProgress` vuelve a retener toda posicion pendiente.
+-- Antes eran dos escrituras con fsync en cada despertar y cada apertura.
 function Queue:holdProgress(identifier)
     local key = progressKey(identifier)
     if key and not self.state.progress_holds[key] then
         self.state.progress_holds[key] = true
-        self:_save()
+        self:_save(true)
     end
 end
 
@@ -127,7 +534,7 @@ function Queue:releaseProgress(identifier)
     local key = progressKey(identifier)
     if key and self.state.progress_holds[key] then
         self.state.progress_holds[key] = nil
-        self:_save()
+        self:_save(true)
     end
 end
 
@@ -201,7 +608,7 @@ function Queue:enqueueEvent(event, options)
                 existing.monotonic_ms = event.monotonic_ms
                     and tostring(event.monotonic_ms) or nil
                 existing.payload = event.payload
-                self:_save()
+                self:_save(options.defer)
                 return copyWireEvent(existing), true
             end
         end
@@ -227,7 +634,9 @@ function Queue:enqueueEvent(event, options)
         _enqueued_at = self.now(),
     }
     table.insert(self.state.outbox, stored)
-    self:_save()
+    -- `defer` agrupa varios eventos en un guardado: quien lo pide llama a
+    -- `flush()` al terminar. `prepareBatch` guarda siempre antes de la red.
+    self:_save(options.defer)
     return copyWireEvent(stored)
 end
 
@@ -354,22 +763,26 @@ function Queue:commitExchange(response, apply_event)
     if not removals then return nil, ack_err end
 
     local deferred, seen = {}, {}
+    -- Lo que `apply_event` haya aplicado antes de fallar ya esta en memoria
+    -- (y en el libro): se guarda igual, aunque el cursor no avance.
+    local function failed()
+        self:flush("consume")
+        return nil, "remote_apply_failed"
+    end
     -- Preview the open book before replaying history, without advancing the
     -- cursor to the preview's sequence. Older servers simply omit this field.
     if type(pull.focus_event) == "table" then
         local event = pull.focus_event
         event.focus_preview = true
         local action = apply_event and apply_event(event) or "defer"
-        if action == false or action == nil then return nil, "remote_apply_failed" end
+        if action == false or action == nil then return failed() end
         if action == "defer" then table.insert(deferred, event) end
         seen[event.event_id] = true
     end
     for _, event in ipairs(pull.events) do
         if not seen[event.event_id] then
             local action = apply_event and apply_event(event) or "defer"
-            if action == false or action == nil then
-                return nil, "remote_apply_failed"
-            end
+            if action == false or action == nil then return failed() end
             if action == "defer" then table.insert(deferred, event) end
         end
     end
@@ -383,17 +796,26 @@ function Queue:commitExchange(response, apply_event)
         item.recorded_at = self.now()
         boundedAppend(self.state.rejected, item, MAX_REJECTED)
     end
-    for _, event in ipairs(deferred) do
-        local index = findById(self.state.inbox, event.event_id)
-        if index and event.focus_preview then
-            self.state.inbox[index] = event
-        elseif not index then
-            boundedAppend(self.state.inbox, event, MAX_INBOX)
+    if #deferred > 0 then
+        -- Solo aca hace falta leer el inbox: un intercambio que no deja nada
+        -- en espera no toca ese archivo.
+        local inbox = self:_inbox()
+        for _, event in ipairs(deferred) do
+            local index = findById(inbox, event.event_id)
+            if index and event.focus_preview then
+                inbox[index] = event
+            elseif not index then
+                self:_noteInboxOverflow(appendInbox(inbox, event))
+            end
         end
+        self:_inboxChanged()
     end
     self.state.applied_cursor = tostring(pull.cursor)
     self.state.last_error = nil
-    self:_save()
+    self._dirty.main = true
+    -- Un solo guardado para todo el intercambio, incluido lo que `apply_event`
+    -- dejo pendiente: primero lo aplicado, al final el cursor.
+    self:flush("consume")
     return {
         acknowledged = #(response.acknowledgements or {}),
         -- C07 · Lo que efectivamente llegó del servidor en este intercambio.
@@ -408,15 +830,29 @@ function Queue:commitExchange(response, apply_event)
 end
 
 function Queue:getInbox()
-    return self.state.inbox
+    return self:_inbox()
 end
 
-function Queue:removeInboxEvent(event_id)
-    local index = findById(self.state.inbox, event_id)
+--- `defer` deja la baja para el proximo `flush("consume")`: aplicar las
+-- anotaciones pendientes de un libro es un guardado, no uno por anotacion.
+function Queue:removeInboxEvent(event_id, defer)
+    local inbox = self:_inbox()
+    local index = findById(inbox, event_id)
     if not index then return false end
-    table.remove(self.state.inbox, index)
-    self:_save()
+    table.remove(inbox, index)
+    self:_inboxChanged()
+    if not defer then self:flush("consume") end
     return true
+end
+
+--- Cuantos eventos esperan a ESTE libro, sin leer el inbox del disco.
+function Queue:inboxCountForBook(identifier)
+    local index = self.state.inbox_index
+    if type(index) ~= "table" or type(index.books) ~= "table" then
+        self:_inbox()
+        index = self.state.inbox_index
+    end
+    return index.books[progressKey(identifier) or "?"] or 0
 end
 
 --- C17 · Las respuestas al diálogo "continuar desde otro dispositivo".
@@ -430,20 +866,50 @@ function Queue:setResumeDecisions(value)
 end
 
 function Queue:getAnnotationState(book_hash)
-    return self.state.annotation_state[book_hash] or {}
+    if type(book_hash) ~= "string" or book_hash == "" then return {} end
+    return self:_book(book_hash) or {}
 end
 
-function Queue:setAnnotationState(book_hash, value)
-    self.state.annotation_state[book_hash] = value or {}
-    self:_save()
+--- Lo ya sincronizado de un libro vive en su propio archivo: anotar un
+-- subrayado reescribe ese libro y nada mas. `defer` lo deja para el proximo
+-- `flush`.
+function Queue:setAnnotationState(book_hash, value, defer)
+    assert(type(book_hash) == "string" and book_hash ~= "", "book_hash is required")
+    value = value or {}
+    local current = self:_book(book_hash)
+    if current ~= value and sameAnnotationState(current or {}, value)
+        and (current ~= nil or next(value) == nil) then
+        -- Nada nuevo que anotar: ni se serializa ni se escribe.
+        return false
+    end
+    self._books[book_hash] = value
+    self._dirty.books[book_hash] = true
+    if not defer then self:flush() end
+    return true
 end
 
 function Queue:v2Count()
     return #self.state.outbox
 end
 
+--- Cuantos eventos del outbox podrian salir ahora: los que no estan retenidos
+-- y, salvo `force`, ya cumplieron su espera de reintento. Con cero, un
+-- intercambio no subiria nada: quien llama puede ahorrarse el pedido.
+function Queue:sendableCount(force)
+    local now, count = self.now(), 0
+    for _, event in ipairs(self.state.outbox) do
+        local held = event.event_type == "progress.changed" and self:isProgressHeld(event.book_identifier)
+        if not held and (force or (tonumber(event._next_attempt_at) or 0) <= now) then
+            count = count + 1
+        end
+    end
+    return count
+end
+
 function Queue:inboxCount()
-    return #self.state.inbox
+    local index = self.state.inbox_index
+    if type(index) ~= "table" or type(index.total) ~= "number" then return #self:_inbox() end
+    return index.total
 end
 
 function Queue:rejectedCount()
@@ -547,7 +1013,7 @@ end
 --- ¿Queda trabajo sin confirmar que un corte de cuenta se llevaría puesto?
 function Queue:hasPendingWork()
     return #self.state.outbox > 0
-        or #self.state.inbox > 0
+        or self:inboxCount() > 0
         or #legacyItems(self) > 0
 end
 
@@ -562,7 +1028,7 @@ function Queue:exportPending()
         install_id = self.state.install_id,
         cursor = self.state.applied_cursor,
         outbox = self.state.outbox,
-        inbox = self.state.inbox,
+        inbox = self:_inbox(),
         rejected = self.state.rejected,
         legacy_pending = legacyItems(self),
     }
@@ -572,23 +1038,35 @@ local function wipeAccountState(self, scope_id)
     local discarded = {
         previous_scope = self.state.account_scope,
         outbox = #self.state.outbox,
-        inbox = #self.state.inbox,
+        inbox = self:inboxCount(),
         rejected = #self.state.rejected,
         legacy = #legacyItems(self),
         cursor = self.state.applied_cursor,
     }
     self.state.account_scope = scope_id
     self.state.outbox = {}
-    self.state.inbox = {}
     self.state.rejected = {}
-    self.state.annotation_state = {}
     self.state.resume_decisions = {}
     self.state.progress_holds = {}
     self.state.applied_cursor = "0"
     -- Pairing may reuse this installation's server device. Keep its sequence
     -- high-water mark across logout/account changes; gaps are harmless.
     self.state.last_error = nil
+    self.state.inbox_dropped = nil
+    -- El inbox y lo sincronizado de cada libro viven en otros archivos. Subir
+    -- la generacion en el estado principal los invalida a todos en ESTE
+    -- guardado: si la corriente se corta despues, ningun archivo de la cuenta
+    -- anterior vuelve a leerse. Recien entonces se vacia el inbox, para que el
+    -- texto de los subrayados del dueno anterior no quede en el disco.
+    self.state.shard_epoch = self.state.shard_epoch + 1
+    self.state.inbox_index = { total = 0, books = {} }
+    self._inbox_events = {}
+    self._books = {}
+    self._dirty.books = {}
+    self._dirty.inbox = false
     self:_save()
+    self._dirty.inbox = true
+    self:flush()
     self.legacy_store:saveSetting("pending", {})
     self.legacy_store:flush()
     return discarded
@@ -656,7 +1134,8 @@ end
 
 function Queue:clear()
     self.state.outbox = {}
-    self.state.inbox = {}
+    self._inbox_events = {}
+    self:_inboxChanged()
     self.state.last_error = nil
     self:_save()
     self.legacy_store:saveSetting("pending", {})

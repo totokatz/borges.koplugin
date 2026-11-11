@@ -8,6 +8,23 @@ release. Una versión sin sección se ofrece igual, sin novedades para mostrar.
 Escribí en criollo y en presente, una línea por cambio, pensando en alguien
 que está por tocar «Actualizar» en un lector de tinta electrónica.
 
+## 2026.11.11.3
+
+- Highlighting uses far less battery. Saving new highlights used to rewrite the whole synchronization file once per highlight; now a group of highlights is one small save.
+- KOReader starts and opens books faster when other readers have left many highlights pending.
+- Changing the font size no longer sends every highlight of the book again, and two readers no longer keep sending each other the same highlight.
+- Putting the reader to sleep sends your position, statistics and highlights together in one step, and waking it with nothing new makes two requests instead of four.
+- Reading without Wi-Fi no longer wakes the reader between pages to save your position; it is saved when KOReader saves, when you close the book and when the reader goes to sleep.
+- Connecting to sync no longer shows KOReader's own "Scanning for networks" and "Connected to network" notices on top of the page.
+- New option in Advanced, for Kobo: Turn Wi-Fi off after syncing. Borges connects in the background with no notice over the page, turns Wi-Fi off as soon as syncing is done so the reader can rest between pages, and turns it on for a moment when you put it to sleep to upload your reading. If it cannot connect when you start reading, it tells you once. Off by default.
+- A note you wrote on a highlight is kept when the same highlight arrives from another reader, and highlights waiting for a book you have not opened are no longer dropped when there are more than 500.
+- Nothing is lost in the change: the previous synchronization file is kept next to the new ones.
+
+## 2026.11.09.1
+
+- Download books from my library now opens a list you can tap, with the most recently added books first. Tap a book to see its size and download it.
+- The list has pages, and Load more books brings the rest when the library is large.
+
 ## 2026.11.05.1
 
 - A position saved from another edition of the book, or from another reader, no longer leaves you where you were and overwrites your place. If it does not exist in this copy, the book opens at the same percentage instead.

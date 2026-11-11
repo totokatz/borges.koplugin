@@ -124,6 +124,26 @@ local function revisionValue(value)
     return text
 end
 
+-- La huella dice si una anotacion cambio. `page` y `total_pages` no entran:
+-- son el numero de pagina de ESTE aparato con ESTA tipografia, y cambian solos
+-- al cambiar el tamano de letra o al recibir la anotacion desde otro lector.
+-- Con ellos adentro, cambiar la fuente re-emitia el libro entero y dos lectores
+-- con paginaciones distintas se devolvian la misma anotacion sin terminar nunca
+-- (en un lector real, 424 de 686 eventos no eran subrayados nuevos). Los dos
+-- campos siguen viajando en el payload; lo que dice DONDE esta el subrayado es
+-- el XPointer, que si entra.
+local RENDER_FIELDS = { book = true, base_revision = true, page = true, total_pages = true }
+-- La formula anterior, solo para reconocer lo ya sincronizado con ella.
+local LEGACY_FIELDS = { book = true, base_revision = true }
+
+local function fingerprintOf(payload, excluded)
+    local fingerprint_payload = {}
+    for key, value in pairs(payload) do
+        if not excluded[key] then fingerprint_payload[key] = value end
+    end
+    return md5(stableEncode(fingerprint_payload))
+end
+
 function AnnotationAdapter:normalize(book_hash, item, book)
     assert(type(book_hash) == "string" and book_hash ~= "", "book_hash is required")
     assert(type(item) == "table", "annotation item is required")
@@ -151,18 +171,23 @@ function AnnotationAdapter:normalize(book_hash, item, book)
         base_revision = item.toto_revision,
         book = bookPayload(book),
     }
-    local fingerprint_payload = {}
-    for key, value in pairs(payload) do
-        if key ~= "book" and key ~= "base_revision" then
-            fingerprint_payload[key] = value
-        end
-    end
     return {
         sync_id = sync_id,
         kind = kind,
         payload = payload,
-        fingerprint = md5(stableEncode(fingerprint_payload)),
+        fingerprint = fingerprintOf(payload, RENDER_FIELDS),
     }
+end
+
+--- Dos anotaciones del mismo libro con el mismo rango derivan el mismo id.
+-- Pasa de verdad: sidecars viejos traen el mismo pasaje subrayado dos veces.
+-- La segunda, si dice otra cosa, necesita identidad propia; si no, la huella
+-- guardada es siempre la de la ultima y la primera se vuelve a mandar en cada
+-- comparacion, para siempre. La semilla sale de lo que no cambia al editarla.
+local function twinSyncId(book_hash, kind, item)
+    return uuidFromSeed(book_hash:lower() .. "|" .. kind .. "|" .. locatorKey(item)
+        .. "|twin|" .. md5(normalizedText(item.text or item.notes))
+        .. "|" .. tostring(item.datetime or ""))
 end
 
 function AnnotationAdapter:diff(book_hash, annotations, previous, book)
@@ -171,37 +196,60 @@ function AnnotationAdapter:diff(book_hash, annotations, previous, book)
     local events, next_state = {}, {}
     local assigned = 0
 
+    -- Lo que la pasada ya vio, por id: sirve para reconocer el mismo pasaje
+    -- anotado dos veces en el sidecar.
+    local seen = {}
+    local function identify(item)
+        local normalized = self:normalize(book_hash, item, book)
+        local twin_fingerprint = seen[normalized.sync_id]
+        if twin_fingerprint == nil then return normalized end
+        -- Copia exacta de una ya vista: una sola identidad, un solo evento.
+        if twin_fingerprint == normalized.fingerprint then return nil end
+        item.toto_sync_id = twinSyncId(book_hash, normalized.kind, item)
+        normalized = self:normalize(book_hash, item, book)
+        if seen[normalized.sync_id] ~= nil then return nil end
+        return normalized
+    end
+
     for _, item in ipairs(annotations) do
         local prior_id = item.toto_sync_id
-        local normalized = self:normalize(book_hash, item, book)
-        if prior_id ~= normalized.sync_id then assigned = assigned + 1 end
-        local old = previous[normalized.sync_id]
-        local old_fingerprint = type(old) == "table" and old.fingerprint or old
-        local old_revision = type(old) == "table"
-            and revisionValue(old.revision) or normalized.payload.base_revision
-        normalized.payload.base_revision = old_revision
-        item.toto_revision = old_revision
-        next_state[normalized.sync_id] = {
-            fingerprint = normalized.fingerprint,
-            kind = normalized.kind,
-            revision = old_revision,
-            present = true,
-        }
-        if old_fingerprint ~= normalized.fingerprint then
-            local event_type
-            if normalized.kind == "bookmark" then
-                event_type = "bookmark.upserted"
-            elseif old_fingerprint == nil then
-                event_type = "annotation.created"
-            else
-                event_type = "annotation.updated"
+        local normalized = identify(item)
+        if prior_id ~= item.toto_sync_id then assigned = assigned + 1 end
+        if normalized then
+            seen[normalized.sync_id] = normalized.fingerprint
+            local old = previous[normalized.sync_id]
+            local old_fingerprint = type(old) == "table" and old.fingerprint or old
+            local old_revision = type(old) == "table"
+                and revisionValue(old.revision) or normalized.payload.base_revision
+            normalized.payload.base_revision = old_revision
+            item.toto_revision = old_revision
+            next_state[normalized.sync_id] = {
+                fingerprint = normalized.fingerprint,
+                kind = normalized.kind,
+                revision = old_revision,
+                present = true,
+            }
+            -- Lo sincronizado con la formula anterior (que incluia la pagina)
+            -- se reconoce y pasa a la nueva sin mandar nada.
+            local changed = old_fingerprint ~= normalized.fingerprint
+                and (old_fingerprint == nil
+                    or old_fingerprint ~= fingerprintOf(normalized.payload, LEGACY_FIELDS))
+            if changed then
+                local event_type
+                if normalized.kind == "bookmark" then
+                    event_type = "bookmark.upserted"
+                elseif old_fingerprint == nil then
+                    event_type = "annotation.created"
+                else
+                    event_type = "annotation.updated"
+                end
+                table.insert(events, {
+                    event_type = event_type,
+                    aggregate_type = "annotation",
+                    aggregate_id = normalized.sync_id,
+                    payload = normalized.payload,
+                })
             end
-            table.insert(events, {
-                event_type = event_type,
-                aggregate_type = "annotation",
-                aggregate_id = normalized.sync_id,
-                payload = normalized.payload,
-            })
         end
     end
 
@@ -265,7 +313,7 @@ local function findExisting(annotations, sync_id, payload)
             if locatorKey(item) == fallback
                 and normalizedText(item.text or item.notes) ==
                     normalizedText(payload.text) then
-                return index, item
+                return index, item, true
             end
         end
     end
@@ -339,7 +387,7 @@ function AnnotationAdapter:applyRemote(event, annotations, options)
     local sync_id = payload.sync_id or (event and event.aggregate_id)
     if not validUuid(sync_id) then return nil, "invalid_sync_id" end
     sync_id = sync_id:lower()
-    local index, existing = findExisting(annotations, sync_id, payload)
+    local index, existing, by_locator = findExisting(annotations, sync_id, payload)
     local deleting = event.event_type == "annotation.deleted"
         or event.event_type == "bookmark.deleted"
     local metadata = event.directive_metadata or {}
@@ -349,6 +397,12 @@ function AnnotationAdapter:applyRemote(event, annotations, options)
     )
 
     if deleting then
+        -- Un borrado solo alcanza a la anotacion con ESE id, nunca a un pasaje
+        -- igual que este lector tiene con identidad propia.
+        if by_locator and validUuid(existing.toto_sync_id)
+            and existing.toto_sync_id:lower() ~= sync_id then
+            index = nil
+        end
         if index then
             if options.remove then
                 options.remove(index, existing)
@@ -365,6 +419,26 @@ function AnnotationAdapter:applyRemote(event, annotations, options)
             present = false,
         }
     end
+
+    -- El mismo pasaje, con el mismo texto, ya esta en este libro con OTRA
+    -- identidad (otro lector deriva sus ids de otra forma). Antes se le pisaba
+    -- el id, se le borraba la nota y el lector terminaba mandando el borrado
+    -- del propio. No se toca: el id ajeno queda anotado como visto y listo.
+    if by_locator and validUuid(existing.toto_sync_id)
+        and existing.toto_sync_id:lower() ~= sync_id then
+        return {
+            action = "noop",
+            sync_id = sync_id,
+            kind = payload.kind == "bookmark" and "bookmark" or "highlight",
+            revision = revision,
+            present = false,
+            twin_of = existing.toto_sync_id:lower(),
+        }
+    end
+    -- Un subrayado local que todavia no tenia identidad y es este mismo pasaje
+    -- la adopta. Su nota es lo unico que la persona escribio ahi: se conserva.
+    local local_note = by_locator and stringValue(existing.note) or nil
+    if local_note == "" then local_note = nil end
 
     payload.sync_id = sync_id
     local incoming, err = buildItem(
@@ -401,6 +475,12 @@ function AnnotationAdapter:applyRemote(event, annotations, options)
         existing or incoming,
         options.book
     )
+    -- La huella anotada es la de lo que mando el otro lector. Con la nota
+    -- local repuesta despues, la proxima comparacion ve la diferencia y la
+    -- sube: se guarda mas, no menos.
+    if local_note and existing.note ~= local_note then
+        existing.note = local_note
+    end
     return {
         action = existing and "updated" or "created",
         sync_id = sync_id,

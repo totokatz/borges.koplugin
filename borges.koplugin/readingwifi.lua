@@ -36,6 +36,9 @@ function ReadingWifi:new(options)
         on_cancel = options.on_cancel,
         on_error = options.on_error,
         valid = options.valid,
+        -- Opcional: corre la llamada que prende el Wi-Fi sin los carteles que
+        -- KOReader dibuja al buscar redes y al conectar.
+        quiet = options.quiet,
     }, self)
 end
 
@@ -150,8 +153,15 @@ function ReadingWifi:_begin()
         if self.recovery_attempted then
             logger.info("Borges: connecting saved Wi-Fi networks after background restore failure (once)")
         end
-        local ok, status = pcall(self.network.enableWifi, self.network, function() self:connected() end)
-        if not ok or status == false then self:_failed() end
+        local function enable()
+            return self.network:enableWifi(function() self:connected() end)
+        end
+        local ok, status
+        if self.quiet then ok, status = pcall(self.quiet, enable) else ok, status = pcall(enable) end
+        if not ok or status == false then self:_failed() return end
+        -- Quien espera puede necesitar saber que el Wi-Fi lo prendio esta
+        -- espera y no la persona ni una restauracion de KOReader.
+        self.enabled_wifi = true
     end
     self.ui:nextTick(self.start_task)
 end

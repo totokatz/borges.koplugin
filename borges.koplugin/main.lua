@@ -124,7 +124,6 @@ local BATCH_SIZE = 3
 local PROGRESS_DEBOUNCE = 60      -- seconds before auto-pushing progress after page activity
 local PROGRESS_COOLDOWN = 180     -- minimum seconds between background progress pushes
 local HIGHLIGHT_DEBOUNCE = 300    -- seconds of quiet before checking changed highlights
-local STATS_SYNC_DEBOUNCE = 120   -- stats SQLite reads are useful, but never urgent
 -- C17 · Dos eventos de red seguidos (asociación + DHCP, o un rebote de la
 -- señal) no son dos reconexiones. Sin esta ventana el lector recibe dos
 -- corridas encimadas y, con ellas, dos diálogos.
@@ -137,6 +136,24 @@ local RECONNECT_DRAIN_DELAY = 5
 -- pregunta por una versión nueva. Buscar versiones nunca compite con
 -- sincronizar ni con la pregunta de posición: llega después, o no llega.
 local PLUGIN_UPDATE_CHECK_DELAY = 30
+-- Wi-Fi solo para sincronizar (ver la seccion del mismo nombre mas abajo).
+-- Segundos entre conectar y apagar: alcanza para la consulta, el envio de lo
+-- pendiente y la pregunta diaria por una version nueva.
+local WIFI_OFF_DELAY = 40
+local WIFI_OFF_RETRY = 15
+local WIFI_OFF_MAX_TRIES = 8
+-- Segundos que KOReader espera antes de dormir mientras el plugin conecta y
+-- sube la lectura. KOReader da 15 y conectar tarda ~10 en un lector real.
+local SLEEP_UPLOAD_WINDOW = 30
+-- Segundos que se le dan a la conexion en segundo plano antes de darla por
+-- fallida. El script de KOReader se rinde solo a los 15.
+-- KOReader cuenta 180 consultas, no segundos: en un lector real se rinde a los
+-- 64-67 s. Se sigue su bandera y esto es solo el techo.
+local QUIET_CONNECT_TIMEOUT = 90
+local QUIET_CONNECT_POLL = 1
+-- Sesiones seguidas en las que conectar en silencio fallo y conectar por el
+-- camino comun anduvo, antes de apagar la opcion sola.
+local QUIET_MISS_LIMIT = 2
 local OLD_DEFAULT_LIBRARY_DIR = "/mnt/onboard/HighlightsDeToto"
 local DEFAULT_LIBRARY_DIR = "/mnt/onboard/Libros"
 
@@ -160,6 +177,51 @@ end
 local function stringOrEmpty(value)
     return optionalString(value) or ""
 end
+
+-- ============================================================
+-- Una instancia viva, una sola cola
+--
+-- KOReader crea una instancia del plugin por cada pantalla: una para el
+-- explorador y otra por cada libro que se abre. Las anteriores no se destruyen
+-- solas: sus temporizadores siguen corriendo. Cada una tenia ademas su propia
+-- copia de la cola leida del disco, asi que una instancia ya reemplazada
+-- seguia sincronizando con numeros de secuencia y marcas viejas. En el log de
+-- un lector real: 42 instancias para 22 aperturas de libro, hasta cinco leyendo
+-- estadisticas a la vez, filas encoladas dos veces y conflictos 409 de
+-- secuencia repetida.
+--
+-- Este archivo se carga una vez por proceso de KOReader, asi que lo que vive
+-- aca lo comparten todas las instancias: la cola (una sola en memoria) y cual
+-- es la instancia vigente, que es la que hereda lo que quedo agendado al
+-- cerrar un libro.
+-- ============================================================
+local Shared = { queue = nil, queue_dir = nil, live = nil,
+    -- Wi-Fi solo para sincronizar: de quien es el Wi-Fi prendido, si el plugin
+    -- lo apago en esta sesion de lectura, y las dos conexiones propias que los
+    -- manejadores de red no tienen que tomar por una reconexion de la persona.
+    wifi_owned = false, wifi_auto_closed = false, wifi_edge = false, wifi_closing = false,
+    -- La conexion silenciosa en curso y si la ultima no llego a conectar.
+    wifi_quiet = nil, wifi_quiet_failed = false }
+
+--- Correr algo que prende el Wi-Fi sin los carteles de KOReader.
+--
+-- `NetworkMgr:enableWifi` dibuja siempre «Scanning for networks…» y despues
+-- «Connected to network X» (tres segundos sobre la pagina) o el error, aunque
+-- quien lo llame no sea la persona. Los muestra en el acto, dentro de la misma
+-- llamada, asi que alcanza con no dejarlos pasar mientras dura. Solo se frenan
+-- los avisos sueltos (InfoMessage): cualquier otra cosa se muestra igual.
+local function withoutNetworkNotices(fn)
+    local show = UIManager.show
+    UIManager.show = function(ui, widget, ...)
+        if type(widget) == "table" and getmetatable(widget) == InfoMessage then return end
+        return show(ui, widget, ...)
+    end
+    local results = { pcall(fn) }
+    UIManager.show = show
+    if not results[1] then error(results[2], 0) end
+    return (table.unpack or unpack)(results, 2)
+end
+HighlightsDeToto._shared = Shared
 
 -- ============================================================
 -- Plugin Directory & Config Paths
@@ -187,8 +249,11 @@ function HighlightsDeToto:init()
     if self:isWebConfigured() then
         ReadingWifi.migrateDirectConnection(G_reader_settings, Device)
     end
-    -- Persist the idempotent schema migration/install ID before pairing can start.
-    self:saveSyncState()
+    -- Persist the idempotent schema migration/install ID before pairing can
+    -- start: solo cuando cargar los ajustes les cambio algo. Este arranque
+    -- corre cada vez que se abre o se cierra un libro, y guardar siempre
+    -- reescribia todos los ajustes de KOReader para no cambiar nada.
+    self:saveSyncState(false, true)
 
     -- Progress sync state
     self.push_timestamp = 0
@@ -217,9 +282,21 @@ function HighlightsDeToto:init()
         end,
     })
 
-    -- Offline queue
-    self.queue = Queue:new(DataStorage:getSettingsDir())
-    self.queue:holdPendingProgress()
+    -- Offline queue: una sola por proceso (ver `Shared`).
+    Shared.live = self
+    local settings_dir = DataStorage:getSettingsDir()
+    local restored = Shared.queue == nil or Shared.queue_dir ~= settings_dir
+    if restored then
+        Shared.queue, Shared.queue_dir = Queue:new(settings_dir), settings_dir
+    end
+    self.queue = Shared.queue
+    -- Antes de que la cola deje asentado algo recibido, el libro tiene que
+    -- tener guardadas las anotaciones que el plugin le agrego.
+    self.queue.before_flush = function() self:_flushSidecarIfDirty() end
+    -- Lo que se leyo del disco al arrancar tiene que volver a consultar la
+    -- ultima lectura. Lo que esta misma sesion ya consulto no: es lo que deja
+    -- subir la posicion final al cerrar el libro.
+    if restored then self.queue:holdPendingProgress() end
     self.diagnostics = Diagnostics:new(DataStorage:getSettingsDir())
     -- Una cola anterior a C06 no tiene dueño anotado, pero sí lo tiene de
     -- hecho: la cuenta con la que este lector ya está vinculado. Anotarlo acá
@@ -273,6 +350,10 @@ function HighlightsDeToto:init()
             end)
         end)
     end
+
+    -- Si la instancia anterior prendio el Wi-Fi para sincronizar, apagarlo le
+    -- toca a esta.
+    self:_scheduleWifiOff(WIFI_OFF_DELAY)
 
     -- C23 · El arranque sólo pregunta si la red YA está prendida. Antes esto
     -- corría igual y terminaba en la pantalla de Wi-Fi de KOReader: abrir un
@@ -406,7 +487,7 @@ function HighlightsDeToto:_initializePairingAndSync()
     if self:getBaseUrl() ~= "" and not self.device_token
         and (self.web_api_key ~= "" or self.pairing_state) then
         UIManager:scheduleIn(8, function()
-            if not NetworkMgr:isConnected() then return end
+            if self._closed or not NetworkMgr:isConnected() then return end
             self:_safecall("pairingMigration", function()
                 if self.pairing_state then
                     self:resumeDevicePairing(false)
@@ -440,6 +521,15 @@ function HighlightsDeToto:_applySyncV2Event(event)
         or event.event_type == "session.started" then
         -- Telemetry is already materialized on the server; other readers do not
         -- need to replay it into KOReader's local statistics database.
+        return true
+    end
+    -- Lo que el servidor guardo como conflicto es la rama que NO quedo
+    -- vigente: esta ahi para que una persona decida, no para aplicarse. Antes
+    -- se escribia igual sobre el libro y el lector quedaba con el contenido
+    -- perdedor bajo la revision del ganador. No espera a ningun libro.
+    if event.directive == "annotation_conflict"
+        or (type(event.directive_metadata) == "table"
+            and event.directive_metadata.annotation_conflict == true) then
         return true
     end
     local identifier = event.book_identifier
@@ -481,11 +571,15 @@ function HighlightsDeToto:_recordOwnAnnotationRevision(event)
         or type(sync_id) ~= "string" then
         return
     end
+    local revision = tostring(metadata.annotation_revision)
     local state = self.queue:getAnnotationState(identifier.value)
     local item_state = state[sync_id]
-    if type(item_state) == "table" then
-        item_state.revision = tostring(metadata.annotation_revision)
-        self.queue:setAnnotationState(identifier.value, state)
+    if type(item_state) == "table" and item_state.revision ~= revision then
+        item_state.revision = revision
+        -- Diferido: el intercambio que trajo este acuse guarda una sola vez al
+        -- terminar. Antes eran un guardado de la cola y uno del sidecar por
+        -- cada subrayado confirmado.
+        self.queue:setAnnotationState(identifier.value, state, true)
     end
     if identifier.value ~= self.book_hash then return end
     local annotation_module = self.ui and self.ui.annotation
@@ -494,15 +588,87 @@ function HighlightsDeToto:_recordOwnAnnotationRevision(event)
     end
     for _, item in ipairs(annotation_module.annotations) do
         if item.toto_sync_id == sync_id then
-            item.toto_revision = tostring(metadata.annotation_revision)
-            self.ui.doc_settings:saveSetting(
-                "annotations",
-                annotation_module.annotations
-            )
-            self.ui.doc_settings:flush()
+            if item.toto_revision ~= revision then
+                item.toto_revision = revision
+                self:_markSidecarDirty()
+            end
             break
         end
     end
+end
+
+--- El plugin cambio anotaciones del libro abierto: aplico una de otro lector
+-- o anoto la revision que confirmo el servidor. El sidecar no se reescribe por
+-- cada una (pesa mas de 100 KB en un libro muy subrayado): queda marcado y
+-- sale una sola vez, siempre ANTES de que la cola guarde lo que eso implica.
+function HighlightsDeToto:_markSidecarDirty()
+    self._sidecar_dirty = true
+end
+
+--- KOReader mantiene la lista de anotaciones ordenada y con su numero de
+-- pagina. Despues de aplicar anotaciones de otro lector hay que rehacer las dos
+-- cosas, una vez, antes de que nadie guarde o dibuje la lista.
+function HighlightsDeToto:_settleAnnotations()
+    if not self._annotations_unsettled then return end
+    self._annotations_unsettled = false
+    local annotation_module = self.ui and self.ui.annotation
+    if annotation_module and annotation_module.updateAnnotations then
+        annotation_module:updateAnnotations(true, true)
+    end
+end
+
+function HighlightsDeToto:_flushSidecarIfDirty()
+    self:_settleAnnotations()
+    if not self._sidecar_dirty then return false end
+    self._sidecar_dirty = false
+    local annotation_module = self.ui and self.ui.annotation
+    if not self.ui or not self.ui.doc_settings or not annotation_module
+        or type(annotation_module.annotations) ~= "table" then
+        return false
+    end
+    self.ui.doc_settings:saveSetting("annotations", annotation_module.annotations)
+    self.ui.doc_settings:flush()
+    self._sidecar_written = true
+    return true
+end
+
+--- Dejar las anotaciones del libro abierto listas para compararse: ordenadas
+-- y con su id estable. NO escribe el sidecar.
+--
+-- KOReader ya guarda el sidecar por su cuenta justo antes de avisar que cierra
+-- el libro y justo antes de avisar que suspende; el plugin lo volvia a
+-- escribir entero (147 KB en el libro abierto de un lector real, 895 KB en el
+-- mas subrayado) dos o tres veces por suspension, hubiera o no algo nuevo. La
+-- escritura queda en _enqueueAnnotationDiff, y solo cuando hay algo que tiene
+-- que estar en el disco antes de que su evento entre a la cola.
+function HighlightsDeToto:_flushSidecar()
+    if not self.ui or not self.ui.doc_settings then return end
+    -- Empieza una pasada de guardado: todavia nadie escribio el sidecar en ella.
+    self._sidecar_written = false
+    self:_settleAnnotations()
+    local annotation_module = self.ui.annotation
+    if self.book_hash and annotation_module and type(annotation_module.annotations) == "table" then
+        -- Si un item raro no se deja normalizar, la comparacion de despues lo
+        -- vuelve a intentar; aca lo unico que no puede fallar es el guardado.
+        local assigned = 0
+        pcall(function()
+            local book = self:_annotationBookDescriptor()
+            for _, item in ipairs(annotation_module.annotations) do
+                if type(item) == "table" and type(item.toto_sync_id) ~= "string" then
+                    AnnotationAdapter:normalize(self.book_hash, item, book)
+                    assigned = assigned + 1
+                end
+            end
+        end)
+        if assigned > 0 then self:_markSidecarDirty() end
+    end
+end
+
+--- Los horarios de la ultima sincronizacion se guardan una vez por operacion,
+-- no una vez por cada anotacion aplicada.
+function HighlightsDeToto:_saveSyncStateIfDirty()
+    if not self._sync_state_dirty then return end
+    self:saveSyncState()
 end
 
 --- C17 · Una sugerencia que llegó por sync se ofrece por el mismo camino que
@@ -561,6 +727,11 @@ end
 
 function HighlightsDeToto:_applyInboxForCurrentBook()
     if not self.book_hash then return end
+    -- Sin nada esperando a este libro no se lee el inbox del disco: abrir un
+    -- libro no tiene que parsear lo pendiente de todos los demas.
+    if self.queue:inboxCountForBook({ kind = "koreader_partial_md5", value = self.book_hash }) == 0 then
+        return
+    end
     local pending = {}
     for _, event in ipairs(self.queue:getInbox()) do
         table.insert(pending, event)
@@ -570,9 +741,16 @@ function HighlightsDeToto:_applyInboxForCurrentBook()
         if identifier and identifier.kind == "koreader_partial_md5"
             and identifier.value == self.book_hash then
             local action = self:_applySyncV2Event(event)
-            if action == true then self.queue:removeInboxEvent(event.event_id) end
+            if action == true then self.queue:removeInboxEvent(event.event_id, true) end
         end
     end
+    -- Un solo guardado para todo lo aplicado, en orden: el sidecar (lo pide la
+    -- cola antes de escribir), lo sincronizado del libro, el inbox sin esos
+    -- eventos y recien entonces el estado. Antes eran cuatro escrituras por
+    -- cada anotacion recibida.
+    self.queue:flush("consume")
+    self:_settleAnnotations()
+    self:_saveSyncStateIfDirty()
 end
 
 -- ============================================================
@@ -620,6 +798,7 @@ function HighlightsDeToto:getConnectionLabel()
 end
 
 function HighlightsDeToto:promptDeviceLogin()
+    self:_keepWifi()
     self:_cancelBackgroundSync()
     local dialog
     dialog = MultiInputDialog:new{
@@ -964,16 +1143,18 @@ function HighlightsDeToto:resumeDevicePairing(interactive)
     end)
 end
 
+--- Subir los subrayados nuevos un rato despues de hacerlos, si hay red.
+--
+-- Antes esto se decidia mirando la fecha del sidecar en CADA vuelta de pagina
+-- (una consulta al sistema de archivos por pagina), y como KOReader reescribe
+-- el sidecar en cada autoguardado y cada despertar, el temporizador se armaba
+-- sin que hubiera ningun subrayado nuevo. Ahora lo arma el aviso de KOReader
+-- de que una anotacion cambio. Sin red no se arma: la comparacion corre igual
+-- al suspender, al cerrar el libro y al apagar el Wi-Fi.
 function HighlightsDeToto:_scheduleHighlightPush()
-    if not self.auto_sync then return end
+    if not self.auto_sync or not self._annotations_modified then return end
     if not self.book_hash or not self.book_file_path then return end
-    if not self:isWebConfigured() then return end
-
-    local mtime = HighlightParser:getSidecarMtime(self.book_file_path)
-    if not mtime then return end
-    if self.last_seen_sidecar_mtime and mtime <= self.last_seen_sidecar_mtime then
-        return
-    end
+    if not self:isWebConfigured() or not NetworkMgr:isConnected() then return end
 
     UIManager:unschedule(self.highlight_push_task)
     UIManager:scheduleIn(HIGHLIGHT_DEBOUNCE, self.highlight_push_task)
@@ -981,20 +1162,10 @@ end
 
 function HighlightsDeToto:_syncHighlightsIfSidecarChanged()
     if not self.book_hash or not self.book_file_path then return end
-    if not self:isWebConfigured() then return end
-
-    local mtime = HighlightParser:getSidecarMtime(self.book_file_path)
-    if not mtime then return end
-    if self.last_seen_sidecar_mtime and mtime <= self.last_seen_sidecar_mtime then
-        return
-    end
-    if self.synced_books and self.synced_books[self.book_file_path] == mtime then
-        self.last_seen_sidecar_mtime = mtime
-        return
-    end
-
+    if not self:isWebConfigured() or not self._annotations_modified then return end
+    self._annotations_modified = false
+    self:_flushSidecar()
     self:syncHighlightsDelta(not NetworkMgr:isConnected(), true)
-    self.last_seen_sidecar_mtime = mtime
 end
 
 -- ============================================================
@@ -1036,6 +1207,7 @@ end
 --- One automatic operation at a time; pending triggers are coalesced by kind.
 -- All settings, queue commits and widget work stay in this parent process.
 function HighlightsDeToto:_runBackgroundSync(label, fn)
+    if self._closed then return false, "closed" end
     if self._background_suspended then return false, "suspended" end
     if Background.current() == self._background_sync and self._background_sync then
         return fn()
@@ -1107,6 +1279,22 @@ function HighlightsDeToto:onExit()
     self:_cancelBackgroundSync()
 end
 
+--- KOReader cerro la pantalla a la que pertenece esta instancia (el libro o el
+-- explorador). Desde aca no hace nada mas: lo que tenia agendado no corre y lo
+-- que quedo pendiente lo toma la instancia nueva, con la misma cola.
+function HighlightsDeToto:onCloseWidget()
+    self._closed = true
+    if Shared.live == self then Shared.live = nil end
+    self:_cancelBackgroundSync()
+    if self.pairing then self.pairing:stopWatching() end
+    if self.periodic_push_task then UIManager:unschedule(self.periodic_push_task) end
+    if self.highlight_push_task then UIManager:unschedule(self.highlight_push_task) end
+    if self._diagnostic_retry then
+        UIManager:unschedule(self._diagnostic_retry)
+        self._diagnostic_retry = nil
+    end
+end
+
 --- Get current xpointer for reflowable docs (EPUB). Returns nil for paged docs (PDF).
 function HighlightsDeToto:_getXPointer()
     if self.has_pages then return nil end
@@ -1151,10 +1339,6 @@ function HighlightsDeToto:_applyAnnotationV2Event(event)
     local mode = self:_annotationMode()
     if not mode then return "defer" end
 
-    if not self._annotation_pull_backed_up then
-        self._annotation_pull_backed_up =
-            self:_backupCurrentMetadataBeforePull() == true
-    end
     local result, err = AnnotationAdapter:applyRemote(
         event,
         annotation_module.annotations,
@@ -1189,14 +1373,21 @@ function HighlightsDeToto:_applyAnnotationV2Event(event)
     end
 
     if result.action ~= "noop" then
-        if annotation_module.updateAnnotations then
-            annotation_module:updateAnnotations(true, true)
+        -- El respaldo copia el sidecar que esta en el disco, que todavia no
+        -- tiene este cambio: alcanza con hacerlo antes del primer guardado.
+        -- Antes se copiaba el archivo entero (hasta 900 KB) en cada apertura
+        -- aunque despues no se aplicara nada.
+        if not self._annotation_pull_backed_up then
+            self._annotation_pull_backed_up =
+                self:_backupCurrentMetadataBeforePull() == true
         end
-        self.ui.doc_settings:saveSetting(
-            "annotations",
-            annotation_module.annotations
-        )
-        self.ui.doc_settings:flush()
+        -- Renumerar y reordenar todas las anotaciones del libro (KOReader le
+        -- pregunta a crengine por cada una) se hace una vez por tanda, no una
+        -- vez por anotacion recibida. Sale siempre antes de guardar.
+        self._annotations_unsettled = true
+        -- Se guarda una vez por operacion, antes de que la cola asiente el
+        -- evento como aplicado (`queue.before_flush`).
+        self:_markSidecarDirty()
     end
 
     local state = self.queue:getAnnotationState(self.book_hash)
@@ -1214,9 +1405,9 @@ function HighlightsDeToto:_applyAnnotationV2Event(event)
             present = true,
         }
     end
-    self.queue:setAnnotationState(self.book_hash, state)
+    self.queue:setAnnotationState(self.book_hash, state, true)
     self.last_web_sync = os.time()
-    self:saveSyncState()
+    self._sync_state_dirty = true
     return true
 end
 
@@ -1236,27 +1427,41 @@ function HighlightsDeToto:_enqueueAnnotationDiff()
         previous,
         self:_annotationBookDescriptor()
     )
-    if assigned > 0 and self.ui and self.ui.doc_settings then
+    -- Primero el libro, despues la cola: un subrayado cuyo evento ya salio
+    -- tiene que estar en el sidecar, o la proxima comparacion lo daria por
+    -- borrado. Sin eventos, sin ids nuevos y sin cambios del plugin no hay
+    -- nada que KOReader no vaya a guardar solo.
+    -- Si en esta misma pasada ya se escribio (la cola lo pide antes de
+    -- guardar), no se escribe otra vez.
+    if (assigned > 0 or self._sidecar_dirty or (#events > 0 and not self._sidecar_written))
+        and self.ui and self.ui.doc_settings then
+        self:_settleAnnotations()
         self.ui.doc_settings:saveSetting(
             "annotations",
             annotation_module.annotations
         )
         self.ui.doc_settings:flush()
+        self._sidecar_dirty = false
     end
+    self._sidecar_written = false
     for _, event in ipairs(events) do
         event.book_identifier = self:_bookIdentifier(self.book_hash)
         event.occurred_at = os.date("!%Y-%m-%dT%H:%M:%SZ")
         event.time_precision = "exact"
-        self.sync_v2:enqueue(event)
+        self.sync_v2:enqueue(event, { defer = true })
     end
-    self.queue:setAnnotationState(self.book_hash, next_state)
+    self.queue:setAnnotationState(self.book_hash, next_state, true)
+    -- Todos los subrayados nuevos y su anotacion de "ya encolado" salen en un
+    -- guardado: primero el outbox, despues el libro. Antes era un guardado de
+    -- toda la cola por cada subrayado.
+    self.queue:flush()
     return #events, assigned
 end
 
-function HighlightsDeToto:_enqueueSessionV2(session_data)
+function HighlightsDeToto:_enqueueSessionV2(session_data, defer)
     if not session_data or not session_data.book_hash then return nil end
     local book_hash = tostring(session_data.book_hash):lower()
-    return self.sync_v2:enqueue{
+    return self.sync_v2:enqueue({
         event_type = "session.ended",
         aggregate_type = "reading_session",
         aggregate_id = "session:" .. book_hash .. ":" .. tostring(session_data.started_at),
@@ -1273,7 +1478,7 @@ function HighlightsDeToto:_enqueueSessionV2(session_data)
             timezone = session_data.timezone or "UTC",
             explicit_jump = session_data.is_jump == true,
         },
-    }
+    }, { defer = defer == true })
 end
 
 function HighlightsDeToto:_progressPayload(is_jump)
@@ -1293,7 +1498,8 @@ function HighlightsDeToto:_progressPayload(is_jump)
     }
 end
 
-function HighlightsDeToto:_enqueueProgressV2(is_jump)
+--- @param defer boolean lo guarda el proximo queue:flush() de quien llama
+function HighlightsDeToto:_enqueueProgressV2(is_jump, defer)
     if not self.book_hash then return nil end
     if is_jump then self:_recordReadingActivity() end
     -- Opening/reconnecting/closing an untouched book is not a new reading.
@@ -1315,6 +1521,7 @@ function HighlightsDeToto:_enqueueProgressV2(is_jump)
         -- Only never-attempted progress may be replaced. Once transport has
         -- seen an event its content remains immutable across every retry.
         coalesce_unattempted = true,
+        defer = defer == true,
     })
     if result then
         self._last_enqueued_progress = signature
@@ -1357,7 +1564,7 @@ function HighlightsDeToto:_syncV2Now(quick, max_pages, force)
     local result, err = self.sync_v2:syncAll(force == true, max_pages or 20, quick)
     if result then
         self.last_progress_sync = os.time()
-        self:saveSyncState()
+        self:saveSyncState(true)
     end
     return result, err
 end
@@ -1373,13 +1580,16 @@ function HighlightsDeToto:_pushProgressOrQueue()
 end
 
 --- Exchange one v2 page and one pre-v2 compatibility item per UI tick.
-function HighlightsDeToto:_drainQueue()
+--- @param after_pull boolean el servidor se acaba de consultar entero: si no
+-- hay nada para subir, otro pedido solo repetiria esa consulta.
+function HighlightsDeToto:_drainQueue(after_pull)
+    if self._closed then return end
     if not Background.current() then
-        return self:_runBackgroundSync("drain", function() self:_drainQueue() end)
+        return self:_runBackgroundSync("drain", function() self:_drainQueue(after_pull) end)
     end
     if not NetworkMgr:isConnected() then return end
     local v2_result, v2_err
-    if self.device_token then
+    if self.device_token and not (after_pull and self.queue:sendableCount() == 0) then
         v2_result, v2_err = self.sync_v2:sync(false, true)
         if v2_err then
             logger.warn("Borges: Borges v2 drain failed:", tostring(v2_err))
@@ -1430,15 +1640,22 @@ end
 -- Also used in onNetworkDisconnecting as last-chance flush before WiFi turns off.
 -- Bounded by Queue:drain's per-item LARGE timeout — typically returns in <10s
 -- when items succeed, faster when offline (skips immediately).
-function HighlightsDeToto:_drainQueueBlocking()
+function HighlightsDeToto:_drainQueueBlocking(quick)
     if not NetworkMgr:isConnected() then return end
-    if self.device_token then
-        local sync_result, sync_err = self:_syncV2Now(false, 50)
+    -- Sin nada que pueda salir no se hace ningun pedido: antes un outbox vacio
+    -- (o con la posicion retenida) costaba igual una consulta al servidor.
+    if self.device_token and self.queue:sendableCount() > 0 then
+        local sync_result, sync_err = self:_syncV2Now(quick == true, 50)
         if not sync_result then
             logger.warn("Borges: blocking v2 drain failed:", tostring(sync_err))
+            -- La red acaba de fallar con la pantalla esperando: lo pendiente
+            -- queda guardado y no se insiste con otro pedido que va a tardar
+            -- lo mismo en fallar.
+            return false
         end
+        self.push_timestamp = os.time()
     end
-    if self.queue:count() == self.queue:v2Count() then return end
+    if self.queue:count() == self.queue:v2Count() then return true end
     local r = self.queue:drain(self:getApi(), self:getBaseUrl(), self:getWebAuth())
     if r and r.sent and r.sent > 0 then
         -- Update sync timestamps for sent items (we don't know per-type from drain,
@@ -1621,11 +1838,15 @@ function HighlightsDeToto:_runConnectedSync(reason, options)
                 logger.warn("Borges: drain held back, remote read failed:",
                     tostring(pull_err))
             else
+                -- Las paginas leidas desde la ultima vez se encolan aca y
+                -- viajan en el mismo envio que el resto. Antes tenian su propio
+                -- temporizador a los dos minutos, con su propio pedido, que
+                -- ademas seguia vivo en instancias ya cerradas.
                 UIManager:scheduleIn(RECONNECT_DRAIN_DELAY, function()
-                    self:_safecall("queueDrain", function() self:_drainQueue() end)
-                end)
-                UIManager:scheduleIn(STATS_SYNC_DEBOUNCE, function()
-                    self:_runBackgroundSync("stats", function() self:syncPageStatsDelta() end)
+                    self:_runBackgroundSync("drain", function()
+                        self:_safecall("statsBeforeDrain", function() self:syncPageStatsDelta(true) end)
+                        self:_safecall("queueDrain", function() self:_drainQueue(true) end)
+                    end)
                 end)
             end
         end
@@ -1914,13 +2135,22 @@ function HighlightsDeToto:_ensureReadingConnection(callback)
     local function valid()
         return self.book_hash == book and self.device_token == token
             and self._background_epoch == epoch and not self._background_suspended
-            and not self._reading_wifi_cancelled
+            and not self._reading_wifi_cancelled and not self._closed
     end
     if not valid() then return end
     if NetworkMgr:isConnected() then callback(); return end
-    self._reading_wifi = ReadingWifi:new{
+    -- Con «Wi-Fi solo para sincronizar» el plugin prende y apaga la radio mas
+    -- seguido: no puede hacerlo con un cartel encima de la pagina cada vez.
+    if self:_wifiOnlyToSyncActive() and self:_connectSilently(callback, valid) then return end
+    local reading_wifi
+    reading_wifi = ReadingWifi:new{
         valid = valid,
-        on_connected = callback,
+        -- El cartel propio alcanza: sin los de KOReader encima.
+        quiet = withoutNetworkNotices,
+        on_connected = function()
+            if reading_wifi.enabled_wifi then self:_ownWifi() end
+            callback()
+        end,
         on_cancel = function()
             self._reading_wifi_cancelled = true
             self.pull_done, self._resume_pull_done = true, true
@@ -1928,7 +2158,241 @@ function HighlightsDeToto:_ensureReadingConnection(callback)
         end,
         on_error = function(message) self:showInfo(message, 6) end,
     }
-    self._reading_wifi:start()
+    self._reading_wifi = reading_wifi
+    reading_wifi:start()
+end
+
+-- ============================================================
+-- Wi-Fi solo para sincronizar (opcional)
+--
+-- Con el Wi-Fi prendido KOReader no deja dormir al procesador entre paginas
+-- (autosuspend: "Don't enter standby if wifi is on"). El plugin lo prende en
+-- cada despertar para consultar la ultima lectura y nadie lo apagaba: en un
+-- lector real, el 83 % del tiempo de lectura (8,3 de 10 horas) fue con Wi-Fi
+-- prendido, con una mediana de 16 minutos por sesion para unos 7 pedidos de
+-- uno o dos segundos.
+--
+-- Con este ajuste el plugin apaga el Wi-Fi que EL prendio cuando termina de
+-- sincronizar, y al suspender lo vuelve a prender un momento para subir la
+-- lectura, que es lo que mantiene el traspaso entre lectores. Es lo que hace
+-- KOSync (el plugin de sincronizacion de KOReader) al suspender, y KOReader lo
+-- contempla: al dormir mata el Wi-Fi que un manejador de Suspend haya dejado.
+--
+-- Nunca toca un Wi-Fi que prendio la persona, ni lo prende al dormir si no lo
+-- apago el mismo en esa sesion. Solo en Kobo, que es donde se conoce el orden
+-- exacto de la suspension. Apagado por defecto hasta validarlo en un lector.
+-- ============================================================
+
+function HighlightsDeToto:canCloseWifiAfterSync()
+    return Device:isKobo() == true and Device:hasWifiToggle() == true
+end
+
+function HighlightsDeToto:isWifiOnlyToSyncEnabled()
+    return self.wifi_only_to_sync == true and self:canCloseWifiAfterSync()
+end
+
+--- El ajuste esta puesto Y el lector deja que KOReader prenda el Wi-Fi sin
+-- preguntar. Con "preguntar" o "ignorar" el plugin no podria volver a prenderlo
+-- al dormir sin pasar por encima de esa eleccion, asi que tampoco lo apaga.
+function HighlightsDeToto:_wifiOnlyToSyncActive()
+    return self:isWifiOnlyToSyncEnabled()
+        and G_reader_settings:readSetting("wifi_enable_action") == "turn_on"
+end
+
+function HighlightsDeToto:toggleWifiOnlyToSync()
+    self.wifi_only_to_sync = not (self.wifi_only_to_sync == true)
+    self.wifi_only_to_sync_note, self.wifi_quiet_misses = nil, 0
+    if not self.wifi_only_to_sync then
+        Shared.wifi_owned, Shared.wifi_auto_closed = false, false
+        Shared.wifi_quiet, Shared.wifi_quiet_failed = nil, false
+    end
+    self:saveSyncState()
+end
+
+function HighlightsDeToto:getWifiOnlyToSyncLabel()
+    if self.wifi_only_to_sync_note == "silent_unavailable" then
+        return _("Turn Wi-Fi off after syncing (turned off: this reader could not connect on its own)")
+    end
+    return _("Turn Wi-Fi off after syncing (saves battery)")
+end
+
+--- Prender el Wi-Fi sin dibujar nada y sin frenar la lectura.
+--
+-- Es el camino con el que KOReader restaura el Wi-Fi al despertar: un script
+-- que conecta en segundo plano con las redes que el lector ya recuerda, y una
+-- consulta periodica que avisa con NetworkConnected cuando hay red. No muestra
+-- ningun cartel y, a diferencia de `enableWifi`, no deja la pantalla sin
+-- responder mientras busca redes. Si no conecta lo dice una vez, con un aviso
+-- que se va solo, y no se pierde nada: lo pendiente sigue en la cola.
+-- @return boolean false cuando este lector no tiene ese camino
+function HighlightsDeToto:_connectSilently(callback, valid)
+    if not Device:hasWifiRestore() or type(NetworkMgr.restoreWifiAsync) ~= "function"
+        or type(NetworkMgr.scheduleConnectivityCheck) ~= "function" then
+        return false
+    end
+    -- Otra conexion ya esta en curso (la persona, KOReader): su aviso de red
+    -- conectada sigue el camino de siempre.
+    if NetworkMgr.pending_connection or NetworkMgr.pending_connectivity_check then return true end
+    logger.info("Borges: connecting Wi-Fi in the background to sync")
+    local quiet = { owner = self, valid = valid, callback = callback }
+    Shared.wifi_quiet, Shared.wifi_quiet_failed = quiet, false
+    local ok = pcall(function()
+        NetworkMgr:restoreWifiAsync()
+        NetworkMgr:scheduleConnectivityCheck()
+    end)
+    if not ok then
+        Shared.wifi_quiet = nil
+        return false
+    end
+    local waited = 0
+    local function observe()
+        if Shared.wifi_quiet ~= quiet then return end -- conecto, o la persona tomo la red
+        waited = waited + QUIET_CONNECT_POLL
+        -- KOReader todavia esta intentando: no se da por perdida antes que el.
+        if (NetworkMgr.pending_connectivity_check or NetworkMgr.pending_connection)
+            and waited < QUIET_CONNECT_TIMEOUT then
+            UIManager:scheduleIn(QUIET_CONNECT_POLL, observe)
+            return
+        end
+        Shared.wifi_quiet = nil
+        if NetworkMgr:isConnected() then return end
+        Shared.wifi_quiet_failed = true
+        logger.info("Borges: background Wi-Fi connection did not complete; pending work stays queued")
+        -- Conectar sin carteles no es fallar sin avisar: es el unico aviso de
+        -- este camino, y solo si la persona sigue leyendo el mismo libro.
+        if quiet.valid() then
+            self:showInfo(_("Could not connect to Wi-Fi. You can keep reading and sync from the menu."), 6)
+        end
+    end
+    UIManager:scheduleIn(QUIET_CONNECT_POLL, observe)
+    return true
+end
+
+--- Conectar en silencio fallo al despertar y el camino comun anduvo al dormir,
+-- en el mismo lugar: este lector no recuerda esa red por su cuenta (esta
+-- guardada solo en KOReader). Despues de dos sesiones asi la opcion se apaga
+-- sola, y el menu dice por que: seguir en silencio seria dejar de consultar la
+-- ultima lectura sin que nadie se entere.
+function HighlightsDeToto:_noteQuietMiss()
+    self.wifi_quiet_misses = (self.wifi_quiet_misses or 0) + 1
+    if self.wifi_quiet_misses >= QUIET_MISS_LIMIT then
+        logger.warn("Borges: this reader cannot connect on its own; turning off Wi-Fi only to sync")
+        self.wifi_only_to_sync = false
+        self.wifi_only_to_sync_note = "silent_unavailable"
+        Shared.wifi_owned, Shared.wifi_auto_closed = false, false
+    end
+    self:saveSyncState(true)
+end
+
+--- El Wi-Fi que esta prendido lo prendio el plugin para sincronizar.
+function HighlightsDeToto:_ownWifi()
+    Shared.wifi_owned, Shared.wifi_auto_closed = true, false
+    self:_scheduleWifiOff(WIFI_OFF_DELAY)
+end
+
+--- La persona esta usando la red para algo que pidio: el Wi-Fi ya no es del
+-- plugin y no lo va a apagar.
+function HighlightsDeToto:_keepWifi()
+    Shared.wifi_owned, Shared.wifi_quiet = false, nil
+    if self._wifi_off_task then
+        UIManager:unschedule(self._wifi_off_task)
+        self._wifi_off_task = nil
+    end
+end
+
+function HighlightsDeToto:_scheduleWifiOff(delay, tries)
+    if not Shared.wifi_owned or not self:_wifiOnlyToSyncActive() then return end
+    if self._wifi_off_task then UIManager:unschedule(self._wifi_off_task) end
+    self._wifi_off_task = function()
+        self._wifi_off_task = nil
+        self:_closeOwnedWifi(tries or 0)
+    end
+    UIManager:scheduleIn(delay, self._wifi_off_task)
+end
+
+--- Mientras algo de esto siga en curso, el Wi-Fi hace falta.
+function HighlightsDeToto:_wifiStillNeeded()
+    if self._background_sync and self._background_sync:isRunning() then return true end
+    if self._background_pending and next(self._background_pending) then return true end
+    if self._connect_sync_running or self._plugin_update_check_running then return true end
+    if self.sync_run and self.sync_run.running then return true end
+    if self.pairing_state or (self._reading_wifi and self._reading_wifi.active) then return true end
+    if self.resume_flow and self.resume_flow:isVisible() then return true end
+    if self._reading_head and self._reading_head.ask then return true end
+    if self.device_token and self.queue:sendableCount() > 0 then return true end
+    return false
+end
+
+function HighlightsDeToto:_closeOwnedWifi(tries)
+    if self._closed or self._background_suspended then return end
+    if not Shared.wifi_owned or not self:_wifiOnlyToSyncActive() then return end
+    if not NetworkMgr:isWifiOn() then
+        Shared.wifi_owned = false
+        return
+    end
+    if self:_wifiStillNeeded() then
+        if tries < WIFI_OFF_MAX_TRIES then
+            return self:_scheduleWifiOff(WIFI_OFF_RETRY, tries + 1)
+        end
+        -- Algo sigue esperando (una pregunta sin responder, un envio que no
+        -- sale): por esta vez el Wi-Fi queda como esta.
+        logger.info("Borges: Wi-Fi left on, sync still has work pending")
+        Shared.wifi_owned = false
+        return
+    end
+    logger.info("Borges: sync finished, turning off the Wi-Fi it had turned on")
+    Shared.wifi_owned = false
+    Shared.wifi_closing = true
+    local ok = pcall(NetworkMgr.disableWifi, NetworkMgr)
+    Shared.wifi_closing = false
+    Shared.wifi_auto_closed = ok
+end
+
+--- Al suspender con el Wi-Fi que el plugin apago: prenderlo para UN envio.
+-- Si conectar no llega a tiempo KOReader lo mata al dormir y todo queda en la
+-- cola, igual que hoy cuando no hay red al suspender.
+function HighlightsDeToto:_uploadBeforeSleep()
+    -- Tambien cuando la conexion silenciosa del despertar no llego a conectar:
+    -- lo leido en esta sesion sube igual, por el camino que prueba todas las
+    -- redes guardadas.
+    local closed_here = Shared.wifi_auto_closed
+    local quiet_failed = Shared.wifi_quiet_failed
+    Shared.wifi_auto_closed, Shared.wifi_quiet_failed, Shared.wifi_quiet = false, false, nil
+    if not (closed_here or quiet_failed) or not self:_wifiOnlyToSyncActive() or not self.device_token then return end
+    if NetworkMgr:isWifiOn() then return end
+    if self.queue:sendableCount() == 0 then return end
+
+    logger.info("Borges: turning Wi-Fi on to upload this reading before sleep")
+    Shared.wifi_edge = true
+    -- El protector de pantalla ya esta puesto: los carteles de KOReader al
+    -- conectar quedarian dibujados sobre el.
+    local ok, status = pcall(withoutNetworkNotices, function()
+      return NetworkMgr:enableWifi(function()
+        if not Shared.wifi_edge then return end -- la persona desperto el lector, o KOReader ya corto
+        Shared.wifi_edge = false
+        if not self._background_suspended or self._closed then return end
+        if quiet_failed then self:_noteQuietMiss() end
+        self:_safecall("sleepUpload", function() self:_drainQueueBlocking(true) end)
+        Shared.wifi_closing = true
+        pcall(NetworkMgr.disableWifi, NetworkMgr)
+        Shared.wifi_closing = false
+        -- Listo: no hace falta esperar el resto de la ventana para dormir.
+        if self._background_suspended and Device.screen_saver_mode == true then
+            pcall(Device.rescheduleSuspend, Device, 2)
+        end
+      end)
+    end)
+    if not ok or status == false then
+        Shared.wifi_edge = false
+        return
+    end
+    -- Este manejador corre ANTES de que KOReader agende su espera de 15 s, asi
+    -- que la ventana se alarga en el tick siguiente.
+    UIManager:nextTick(function()
+        if Shared.wifi_edge and self._background_suspended and Device.screen_saver_mode == true then
+            pcall(Device.rescheduleSuspend, Device, SLEEP_UPLOAD_WINDOW)
+        end
+    end)
 end
 
 --- Called when a book is opened and ready to read.
@@ -1964,7 +2428,6 @@ function HighlightsDeToto:onReaderReady()
             self.book_file_path = self.ui.document.file or ""
             -- Extract book filename for display/fallback
             self.book_filename = self.book_file_path:match("([^/\\]+)$") or ""
-            self.last_seen_sidecar_mtime = HighlightParser:getSidecarMtime(self.book_file_path)
             self._annotation_pull_backed_up = false
             self._last_handled_page = self.ui:getCurrentPage()
             self._last_handled_xpointer = self._getXPointer and self:_getXPointer()
@@ -2014,29 +2477,31 @@ function HighlightsDeToto:onCloseDocument()
     if not self.book_hash then return end
 
     -- 1. Capture final progress while this document is still available.
-    self:_safecall("pushProgress", function() self:_enqueueProgressV2(false) end)
+    -- Posicion, sesion, estadisticas y subrayados se guardan juntos al final,
+    -- en una escritura de la cola.
+    self:_safecall("pushProgress", function() self:_enqueueProgressV2(false, true) end)
 
     -- 2. Finish session and ENQUEUE (payload is tiny ~200B, drain will send it)
     self:_safecall("session", function()
         for _, session_data in ipairs(self.session:finishAll()) do
-            self:_enqueueSessionV2(session_data)
+            self:_enqueueSessionV2(session_data, true)
         end
     end)
 
-    -- 3. Flush doc settings so sidecar has the very latest annotations
-    if self.ui and self.ui.doc_settings then
-        self.ui.doc_settings:flush()
-    end
+    -- 3. KOReader acaba de guardar el sidecar (lo hace antes de avisar que
+    -- cierra): aca solo se dejan las anotaciones listas para comparar.
+    self:_safecall("prepareAnnotations", function() self:_flushSidecar() end)
 
-    -- 4. Persist the annotation delta without waiting on the network.
-    self:_safecall("highlightSync", function()
-        self:syncHighlightsDelta(true)
-    end)
-
-    -- 5. Persist the statistics delta for the same background drain.
+    -- 4. Persist the statistics delta for the same background drain.
     self:_safecall("statsSync", function()
         self:syncPageStatsDelta(true)
     end)
+
+    -- 5. Persist the annotation delta without waiting on the network.
+    self:_safecall("highlightSync", function()
+        self:syncHighlightsDelta(true)
+    end)
+    self:_safecall("closeSave", function() self.queue:flush() end)
 
     -- Clean up
     -- C17 · Un diálogo que se cierra junto con el libro no puede dejar la
@@ -2046,22 +2511,28 @@ function HighlightsDeToto:onCloseDocument()
     self.book_file_path = nil
     self.has_pages = nil
     self._annotation_pull_backed_up = nil
-    self.last_seen_sidecar_mtime = nil
+    self._sidecar_dirty = nil
+    self._annotations_modified = nil
     self._last_handled_page = nil
     self._last_handled_xpointer = nil
     self._last_handled_page_at = nil
 
-    -- 6. Send the durable work after returning control to the reader.
+    -- 6. Send the durable work after returning control to the reader. Para
+    -- entonces esta instancia ya no existe: lo manda la que la reemplazo, que
+    -- comparte la cola.
     UIManager:scheduleIn(2, function()
-        self:_safecall("queueDrain", function() self:_drainQueue() end)
+        local plugin = Shared.live
+        if plugin then plugin:_safecall("queueDrain", function() plugin:_drainQueue() end) end
     end)
 
     -- C23 · Cerrar el libro devuelve al explorador: ahí el aviso de versión
     -- nueva no tapa nada. Es el momento que reemplaza al cartel que antes
     -- podía salir en medio de una página.
     UIManager:scheduleIn(3, function()
-        self:_safecall("updateNoticeOnClose", function()
-            self:_announcePluginUpdate("close_document")
+        local plugin = Shared.live
+        if not plugin then return end
+        plugin:_safecall("updateNoticeOnClose", function()
+            plugin:_announcePluginUpdate("close_document")
         end)
     end)
 end
@@ -2109,9 +2580,29 @@ function HighlightsDeToto:_handlePageChange(pageno)
         end)
     end
 
-    -- Debounced auto-push of progress
+    -- Debounced auto-push of progress. Sin red no se arma: no hay a quien
+    -- subirle nada, y cada temporizador pendiente es una alarma que saca al
+    -- lector del standby (en un lector real la pausa mediana por pagina es de
+    -- 84 s: este disparaba en dos de cada tres paginas). La posicion se encola
+    -- igual al guardar KOReader, al suspender y al cerrar.
     UIManager:unschedule(self.periodic_push_task)
-    UIManager:scheduleIn(PROGRESS_DEBOUNCE, self.periodic_push_task)
+    if NetworkMgr:isConnected() then
+        UIManager:scheduleIn(PROGRESS_DEBOUNCE, self.periodic_push_task)
+    end
+end
+
+--- KOReader guarda los ajustes del libro (autoguardado cada 15 minutos, al
+-- suspender, al cerrar). Leyendo sin red es el momento de dejar la posicion en
+-- la cola: una escritura chica cada tanto en vez de una por pausa de lectura.
+function HighlightsDeToto:onSaveSettings()
+    if not self.book_hash or self._closed or NetworkMgr:isConnected() then return end
+    if not self:isWebConfigured() then return end
+    self:_safecall("saveSettingsProgress", function() self:_enqueueProgressV2(false) end)
+end
+
+--- KOReader avisa cada vez que se crea, edita o borra una anotacion.
+function HighlightsDeToto:onAnnotationsModified()
+    self._annotations_modified = true
     self:_scheduleHighlightPush()
 end
 
@@ -2124,7 +2615,18 @@ function HighlightsDeToto:onSuspend()
     self._background_suspended = true
     self:_cancelBackgroundSync()
     self.pairing:stopWatching()
-    if not self.book_hash then return end
+    -- Dormido no hay nada que subir: un temporizador pendiente solo serviria
+    -- para despertar al lector.
+    UIManager:unschedule(self.periodic_push_task)
+    UIManager:unschedule(self.highlight_push_task)
+    if self._wifi_off_task then
+        UIManager:unschedule(self._wifi_off_task)
+        self._wifi_off_task = nil
+    end
+    if not self.book_hash then
+        self:_safecall("sleepUploadWithoutBook", function() self:_uploadBeforeSleep() end)
+        return
+    end
 
     local flushed_before_suspend = self._disconnect_flush_book_hash == self.book_hash
         and self._disconnect_flush_at
@@ -2132,41 +2634,47 @@ function HighlightsDeToto:onSuspend()
     self._disconnect_flush_book_hash = nil
     self._disconnect_flush_at = nil
 
-    -- Push progress (quick HTTP if still connected on non-Kobo paths, enqueue otherwise)
+    -- Donde el Wi-Fi sigue prendido al suspender (no es el caso del Kobo, que
+    -- lo apaga antes), todo sale en un intercambio al final.
+    local upload_now = self.force_sync_before_sleep and NetworkMgr:isConnected()
+
+    -- Todo lo de esta lectura se guarda en UNA escritura de la cola, al final:
+    -- antes eran una por la posicion, una por la sesion y una por cada tanda de
+    -- estadisticas.
     if not flushed_before_suspend then
-        self:_safecall("suspendProgress", function() self:_pushProgressOrQueue() end)
+        self:_safecall("suspendProgress", function()
+            if upload_now or not NetworkMgr:isConnected() then
+                self:_enqueueProgressV2(false, true)
+            else
+                self:_pushProgressOrQueue()
+            end
+        end)
     end
 
     -- Finish session and always enqueue (no HTTP during suspend — keeps sleep fast)
     self:_safecall("suspendSession", function()
         for _, session_data in ipairs(self.session:finishAll()) do
-            self:_enqueueSessionV2(session_data)
+            self:_enqueueSessionV2(session_data, true)
         end
     end)
 
-    -- Flush doc settings to disk so sidecar has the very latest annotations
-    self:_safecall("suspendFlush", function()
-        if self.ui and self.ui.doc_settings then
-            self.ui.doc_settings:flush()
-        end
-    end)
+    self:_safecall("suspendFlush", function() self:_flushSidecar() end)
 
-    if self.force_sync_before_sleep and NetworkMgr:isConnected() then
-        self:_safecall("forceSleepHighlights", function() self:syncHighlightsDelta(false, true) end)
-        self:_safecall("forceSleepStats", function() self:syncPageStatsDelta(false, true) end)
-        self:_safecall("forceSleepQueueDrain", function() self:_drainQueueBlocking() end)
+    if upload_now then
+        self:_safecall("forceSleepStats", function() self:syncPageStatsDelta(true) end)
+        self:_safecall("forceSleepHighlights", function() self:syncHighlightsDelta(false, true, true) end)
+        self:_safecall("forceSleepSave", function() self.queue:flush() end)
+        self:_safecall("forceSleepQueueDrain", function() self:_drainQueueBlocking(true) end)
         return
     end
 
-    if flushed_before_suspend then
-        return
+    if not flushed_before_suspend then
+        -- Enqueue stats delta and highlights for sync on next resume
+        self:_safecall("suspendStats", function() self:syncPageStatsDelta(true) end)
+        self:_safecall("suspendHighlights", function() self:syncHighlightsDelta(true) end)
     end
-
-    -- Enqueue highlights for sync on next resume
-    self:_safecall("suspendHighlights", function() self:syncHighlightsDelta(true) end)
-
-    -- Enqueue stats delta for sync on next resume
-    self:_safecall("suspendStats", function() self:syncPageStatsDelta(true) end)
+    self:_safecall("suspendSave", function() self.queue:flush() end)
+    self:_safecall("sleepUploadWithBook", function() self:_uploadBeforeSleep() end)
 end
 
 --- Called when device wakes from standby.
@@ -2175,6 +2683,7 @@ end
 function HighlightsDeToto:onResume()
     self._background_suspended = false
     self._reading_wifi_cancelled = false
+    Shared.wifi_edge, Shared.wifi_auto_closed = false, false
     if self.pairing_state then self:watchDevicePairing(self.pairing_state, false) end
     self:_safecall("onResume", function()
         self:_closeSuspendSyncBanner()
@@ -2230,16 +2739,38 @@ end
 -- corridas. Si la consulta de apertura o de resume está por correr, gana la
 -- primera y la otra queda absorbida por esa misma ventana.
 function HighlightsDeToto:onNetworkConnecting()
+    -- La conexion de antes de dormir es del plugin y no empieza una lectura:
+    -- no hay nada que volver a consultar ni que retener.
+    if Shared.wifi_edge then return end
     self._reading_wifi_cancelled = false
     self:_beginReadingHandoff()
 end
 
 function HighlightsDeToto:onNetworkConnected()
+    if Shared.wifi_edge then return end
     if self._reading_wifi_cancelled then return end
+    local quiet = Shared.wifi_quiet
+    Shared.wifi_quiet = nil
+    if quiet then
+        -- La conexion silenciosa que pidio el plugin: el Wi-Fi es suyo.
+        if (self.wifi_quiet_misses or 0) > 0 then
+            self.wifi_quiet_misses = 0
+            self:saveSyncState(true)
+        end
+        self:_ownWifi()
+    elseif not (self._reading_wifi and self._reading_wifi.active and self._reading_wifi.enabled_wifi) then
+        -- Una conexion que no abrio el plugin es de la persona: no se apaga sola.
+        Shared.wifi_owned, Shared.wifi_auto_closed = false, false
+    end
     if not self._reading_head then self:_beginReadingHandoff() end
     UIManager:scheduleIn(5, function() self:_flushDiagnostics() end)
     if not self:isWebConfigured() then return end
+    self:_scheduleHighlightPush()
     self:_safecall("networkConnectedSync", function()
+        if quiet and quiet.owner == self and quiet.valid() then
+            quiet.callback()
+            return
+        end
         local resumed = self._reading_wifi and self._reading_wifi:connected()
         if not resumed then self:_runConnectedSync("network") end
     end)
@@ -2259,6 +2790,15 @@ end
 -- suspend path, etc). This is the last chance to use the existing connection:
 -- on Kobo, KOReader disables WiFi before broadcasting Suspend.
 function HighlightsDeToto:onNetworkDisconnecting()
+    -- El plugin apaga el Wi-Fi que el mismo prendio, con todo ya enviado: no
+    -- hay "ultima oportunidad" que aprovechar ni cartel que mostrar.
+    if Shared.wifi_closing then return end
+    if Shared.wifi_edge then
+        -- KOReader corta la conexion de antes de dormir: se acabo la ventana.
+        Shared.wifi_edge = false
+        return
+    end
+    Shared.wifi_owned = false
     self:_cancelBackgroundSync()
     -- Canceling a connection must not trigger synchronous "last chance"
     -- uploads: the reader explicitly chose to continue without syncing.
@@ -2267,21 +2807,33 @@ function HighlightsDeToto:onNetworkDisconnecting()
 
     if self.book_hash then
         logger.info("Borges: onNetworkDisconnecting - flushing current book")
-        self:_safecall("disconnectingProgress", function() self:_pushProgressOrQueue() end)
-        self:_safecall("disconnectingFlush", function()
-            if self.ui and self.ui.doc_settings then
-                self.ui.doc_settings:flush()
-            end
-        end)
-        self:_safecall("disconnectingHighlights", function() self:syncHighlightsDelta(false, true) end)
-        self:_safecall("disconnectingStats", function() self:syncPageStatsDelta(false, true) end)
+        -- Todo se guarda primero y viaja despues en UN intercambio. Antes eran
+        -- hasta cuatro pedidos seguidos con la pantalla esperando (posicion,
+        -- subrayados, estadisticas y cola), cada uno con su saludo TLS. La
+        -- posicion entra primera a la cola, asi que sale en la primera tanda.
+        self:_safecall("disconnectingProgress", function() self:_enqueueProgressV2(false, true) end)
+        -- Si el Wi-Fi se apaga porque el lector se va a dormir (KOReader ya
+        -- mostro el protector de pantalla), la sesion de lectura termina aca y
+        -- sube en este mismo intercambio. Antes se cerraba un instante despues,
+        -- ya sin red, y obligaba a un pedido mas en el proximo despertar.
+        if Device.screen_saver_mode == true then
+            self:_safecall("disconnectingSession", function()
+                for _, session_data in ipairs(self.session:finishAll()) do
+                    self:_enqueueSessionV2(session_data, true)
+                end
+            end)
+        end
+        self:_safecall("disconnectingFlush", function() self:_flushSidecar() end)
+        self:_safecall("disconnectingStats", function() self:syncPageStatsDelta(true) end)
+        self:_safecall("disconnectingHighlights", function() self:syncHighlightsDelta(false, true, true) end)
+        self:_safecall("disconnectingSave", function() self.queue:flush() end)
         self._disconnect_flush_book_hash = self.book_hash
         self._disconnect_flush_at = os.time()
     end
 
     if self.queue:count() > 0 then
         logger.info("Borges: onNetworkDisconnecting - flushing queue")
-        self:_safecall("disconnectingDrain", function() self:_drainQueueBlocking() end)
+        self:_safecall("disconnectingDrain", function() self:_drainQueueBlocking(true) end)
     end
 
     self:_showSuspendSyncStatus()
@@ -3061,7 +3613,7 @@ end
 -- identifier before incremental create/update/delete takes over.
 -- @param enqueue_only boolean (optional) if true, always enqueue instead of POSTing (for suspend)
 -- @param quick boolean (optional) use shorter HTTP timeout (5/10s) — for close/disconnect paths
-function HighlightsDeToto:syncHighlightsDelta(enqueue_only, quick)
+function HighlightsDeToto:syncHighlightsDelta(enqueue_only, quick, defer_exchange)
     if not self.book_hash then return end
     if not self:isWebConfigured() then return end
 
@@ -3072,11 +3624,26 @@ function HighlightsDeToto:syncHighlightsDelta(enqueue_only, quick)
         return
     end
 
-    local payload, count = HighlightParser:generateApiPayloadForBook(file_path)
-    if payload then self:_attachCurrentBookHash(payload) end
+    local bridged = self.annotation_v2_bridged[self.book_hash] == true
+    local payload, count
+    if not bridged and not enqueue_only and NetworkMgr:isConnected() then
+        -- La foto historica se manda una sola vez por edicion. Armarla relee y
+        -- vuelve a interpretar el sidecar entero del disco: solo vale la pena
+        -- cuando de verdad se va a mandar, no en cada suspension.
+        -- La foto sale del sidecar que esta en el disco. Puede no tener lo
+        -- subrayado desde el ultimo guardado de KOReader, y no importa: eso
+        -- viaja igual como eventos v2 en la comparacion de abajo. Un libro sin
+        -- ninguna anotacion no tiene historia que importar.
+        local annotation_module = self.ui and self.ui.annotation
+        local annotated = not annotation_module or type(annotation_module.annotations) ~= "table"
+            or #annotation_module.annotations > 0
+        if annotated then
+            payload, count = HighlightParser:generateApiPayloadForBook(file_path)
+        end
+        if payload then self:_attachCurrentBookHash(payload) end
+    end
     count = count or 0
 
-    local bridged = self.annotation_v2_bridged[self.book_hash] == true
     if not bridged and payload and count > 0
         and not enqueue_only and NetworkMgr:isConnected() then
         local result, err = self:getApi():postJSON(
@@ -3101,17 +3668,27 @@ function HighlightsDeToto:syncHighlightsDelta(enqueue_only, quick)
         end
     end
 
+    -- El tiempo queda en el log a proposito: es la unica medicion que se
+    -- puede hacer en el lector mismo, y permite comparar versiones leyendo el
+    -- crash.log en vez de suponer.
+    local ok_socket, socket = pcall(require, "socket")
+    local started = ok_socket and socket.gettime and socket.gettime() or os.clock()
     local event_count, assigned = self:_enqueueAnnotationDiff()
+    local finished = ok_socket and socket.gettime and socket.gettime() or os.clock()
     logger.info(
         "Borges: annotation delta enqueued",
         event_count,
         "events;",
         assigned,
-        "stable IDs assigned"
+        "stable IDs assigned;",
+        math.floor((finished - started) * 1000 + 0.5),
+        "ms"
     )
 
+    -- defer_exchange: quien llama manda todo junto despues, en un solo
+    -- intercambio (un pedido es un saludo TLS completo en el lector).
     local sync_result
-    if event_count > 0 and not enqueue_only
+    if event_count > 0 and not enqueue_only and not defer_exchange
         and NetworkMgr:isConnected() and self.device_token then
         sync_result = self:_syncV2Now(quick, math.max(4, event_count + 2))
     end
@@ -3121,7 +3698,7 @@ function HighlightsDeToto:syncHighlightsDelta(enqueue_only, quick)
         local mtime = HighlightParser:getSidecarMtime(file_path)
         if mtime then self.synced_books[file_path] = mtime end
     end
-    self:saveSyncState()
+    self:saveSyncState(true)
 end
 
 --- Force sync highlights now (for manual menu action). Same path as delta.
@@ -3167,6 +3744,8 @@ function HighlightsDeToto:_enqueueStatsV2(data)
             payload = chunk,
         }, {
             coalesce_unattempted = true,
+            -- Todas las tandas en un guardado: lo hace quien llama.
+            defer = true,
         })
         Background.yieldToUI()
     end
@@ -3188,14 +3767,14 @@ function HighlightsDeToto:syncPageStatsDelta(enqueue_only, quick, force)
         if err then
             logger.warn("Borges: stats delta read failed:", err)
             self.last_stats_error = err
-            self:saveSyncState()
+            self:saveSyncState(true)
         end
         return
     end
 
     if self.last_stats_error then
         self.last_stats_error = nil
-        self:saveSyncState()
+        self:saveSyncState(true)
     end
 
     if data.total_rows == 0 then
@@ -3206,13 +3785,19 @@ function HighlightsDeToto:syncPageStatsDelta(enqueue_only, quick, force)
     logger.info("Borges: stats delta -", data.total_rows, "rows to sync")
 
     local chunk_count, watermark = self:_enqueueStatsV2(data)
+    -- Primero las filas a la cola (un guardado para todas las tandas) y recien
+    -- despues la marca de hasta donde se leyo. La marca no fuerza una escritura
+    -- de los ajustes de KOReader (24 KB): sale con el proximo guardado que haga
+    -- KOReader. Si se pierde, las mismas filas se vuelven a encolar y el
+    -- servidor las reconoce (ON CONFLICT DO NOTHING).
+    self.queue:flush()
     if watermark then
         self.last_stats_enqueued_at = math.max(
             tonumber(self.last_stats_enqueued_at) or 0,
             watermark
         )
     end
-    self:saveSyncState()
+    self:saveSyncState(true)
     logger.info(
         "Borges: stats durably enqueued,",
         data.total_rows,
@@ -3234,7 +3819,7 @@ function HighlightsDeToto:syncPageStatsDelta(enqueue_only, quick, force)
                 tostring(post_err)
             )
         end
-        self:saveSyncState()
+        self:saveSyncState(true)
     end
 end
 
@@ -3339,20 +3924,40 @@ end
 -- Settings Management
 -- ============================================================
 
-function HighlightsDeToto:loadConfigFile()
-    local config_path = self:getConfigFilePath()
+--- Un archivo de configuracion editable por USB, leido una vez.
+--
+-- Estos dos archivos se abrian, se leian y se interpretaban en cada arranque
+-- del plugin -cada vez que se abre o se cierra un libro- aunque nadie los
+-- hubiera tocado (el de Dropbox, 102 veces en el log de un lector que no usa
+-- Dropbox). Ahora se vuelven a leer solo si cambiaron de fecha o de tamano.
+local function readConfigFile(config_path)
+    Shared.config_files = Shared.config_files or {}
+    local ok_lfs, lfs = pcall(require, "libs/libkoreader-lfs")
+    local attributes = ok_lfs and lfs.attributes(config_path) or nil
+    local stamp = type(attributes) == "table"
+        and (tostring(attributes.modification) .. ":" .. tostring(attributes.size)) or nil
+    local cached = Shared.config_files[config_path]
+    if ok_lfs and cached and cached.stamp == stamp then return cached.data end
+    local data
     local f = io.open(config_path, "r")
-    if not f then return nil end
-    local content = f:read("*a")
-    f:close()
-    if not content or content == "" then return nil end
-    local ok, data = pcall(rapidjson.decode, content)
-    if not ok or type(data) ~= "table" then
-        logger.warn("Borges: Failed to parse", config_path)
-        return nil
+    if f then
+        local content = f:read("*a")
+        f:close()
+        if content and content ~= "" then
+            local ok, decoded = pcall(rapidjson.decode, content)
+            if ok and type(decoded) == "table" then
+                data = decoded
+            else
+                logger.warn("Borges: Failed to parse", config_path)
+            end
+        end
     end
-    logger.info("Borges: Loaded config from", config_path)
+    Shared.config_files[config_path] = { stamp = stamp, data = data }
     return data
+end
+
+function HighlightsDeToto:loadConfigFile()
+    return readConfigFile(self:getConfigFilePath())
 end
 
 function HighlightsDeToto:saveConfigFile()
@@ -3373,18 +3978,7 @@ function HighlightsDeToto:saveConfigFile()
 end
 
 function HighlightsDeToto:loadWebConfigFile()
-    local config_path = self:getWebConfigFilePath()
-    local f = io.open(config_path, "r")
-    if not f then return nil end
-    local content = f:read("*a")
-    f:close()
-    if not content or content == "" then return nil end
-    local ok, data = pcall(rapidjson.decode, content)
-    if not ok or type(data) ~= "table" then
-        logger.warn("Borges: Failed to parse", config_path)
-        return nil
-    end
-    return data
+    return readConfigFile(self:getWebConfigFilePath())
 end
 
 function HighlightsDeToto:saveWebConfigFile()
@@ -3407,6 +4001,13 @@ end
 
 function HighlightsDeToto:loadSettings()
     local raw_settings = G_reader_settings:readSetting("highlightsdetoto") or {}
+    -- Lo que hay guardado, antes de migrar nada. La primera vez del proceso es
+    -- ademas lo que hay en el disco.
+    self._loaded_settings_digest = AnnotationAdapter.stableEncode(raw_settings)
+    if Shared.settings_flushed == nil then
+        Shared.settings_flushed = self._loaded_settings_digest
+        Shared.settings_saved = self._loaded_settings_digest
+    end
     local web_config = self:loadWebConfigFile()
     local settings = SettingsMigration.migrate(raw_settings, web_config)
     self:_applyMigratedSettings(settings)
@@ -3433,6 +4034,9 @@ function HighlightsDeToto:loadSettings()
     self.auto_pull_highlights = settings.auto_pull_highlights ~= false
     self.auto_pull_progress = settings.auto_pull_progress ~= false
     self.force_sync_before_sleep = settings.force_sync_before_sleep ~= false
+    self.wifi_only_to_sync = settings.wifi_only_to_sync == true
+    self.wifi_only_to_sync_note = settings.wifi_only_to_sync_note
+    self.wifi_quiet_misses = tonumber(settings.wifi_quiet_misses) or 0
     self.last_web_sync = settings.last_web_sync or 0
     self.synced_books = settings.synced_books or {}
     self.annotation_v2_bridged = settings.annotation_v2_bridged or {}
@@ -3562,6 +4166,9 @@ function HighlightsDeToto:_currentSettings()
         auto_pull_highlights = self.auto_pull_highlights,
         auto_pull_progress = self.auto_pull_progress,
         force_sync_before_sleep = self.force_sync_before_sleep,
+        wifi_only_to_sync = self.wifi_only_to_sync == true or nil,
+        wifi_only_to_sync_note = self.wifi_only_to_sync_note,
+        wifi_quiet_misses = (self.wifi_quiet_misses or 0) > 0 and self.wifi_quiet_misses or nil,
         last_web_sync = self.last_web_sync,
         synced_books = self.synced_books,
         annotation_v2_bridged = self.annotation_v2_bridged,
@@ -3584,9 +4191,33 @@ function HighlightsDeToto:_currentSettings()
 end
 
 --- Save only sync state (fast, no config file writes).
-function HighlightsDeToto:saveSyncState()
-    G_reader_settings:saveSetting("highlightsdetoto", self:_currentSettings())
-    G_reader_settings:flush()
+-- Con `lazy` el cambio queda en memoria y lo escribe el proximo guardado de
+-- ajustes de KOReader (al suspender, al cerrar el libro o en su autoguardado).
+-- Es para lo que solo son horarios de "ultima sincronizacion": perderlos en un
+-- corte cuesta, como mucho, repetir una comparacion. Credenciales, cuenta y
+-- configuracion siguen escribiendose en el momento.
+--
+-- Guardar algo que no cambio no escribe nada. `G_reader_settings:flush()`
+-- reescribe TODOS los ajustes de KOReader (24 KB en un lector real) y se
+-- llamaba en cada arranque del plugin -o sea, cada vez que se abre o cierra un
+-- libro- aunque no hubiera nada nuevo. La comparacion es por contenido: varias
+-- de estas tablas se modifican en el lugar, asi que comparar referencias diria
+-- "igual" de algo que si cambio.
+-- @param only_if_migrated boolean (el arranque) guardar solo si cargar los
+-- ajustes les cambio algo; lo que otra instancia dejo sin forzar sigue asi.
+function HighlightsDeToto:saveSyncState(lazy, only_if_migrated)
+    self._sync_state_dirty = false
+    local settings = self:_currentSettings()
+    local digest = AnnotationAdapter.stableEncode(settings)
+    if only_if_migrated and digest == self._loaded_settings_digest then return end
+    if digest ~= Shared.settings_saved then
+        G_reader_settings:saveSetting("highlightsdetoto", settings)
+        Shared.settings_saved = digest
+    end
+    if not lazy and digest ~= Shared.settings_flushed then
+        G_reader_settings:flush()
+        Shared.settings_flushed = digest
+    end
 end
 
 --- Save settings + config files (use when config values changed).
@@ -3602,7 +4233,7 @@ end
 
 function HighlightsDeToto:_flushDiagnostics()
     pcall(function()
-        if not self.diagnostics then return end
+        if self._closed or not self.diagnostics then return end
         self.diagnostics:scope(self.paired_device_id)
         if NetworkMgr:isConnected() and self.device_token then
             local api, base_url, auth = self:getApi(), self:getBaseUrl(), self:getWebAuth()
@@ -3687,6 +4318,7 @@ end
 --- Búsqueda manual. Es una orden del lector: puede pedir el Wi-Fi, saltea el
 -- intervalo y el backoff, y siempre contesta algo.
 function HighlightsDeToto:checkPluginUpdate(show_no_update)
+    self:_keepWifi()
     self:_cancelBackgroundSync()
     if not self:isWebConfigured() then
         if show_no_update then
@@ -3703,6 +4335,7 @@ end
 -- pregunta dos veces seguidas: si `UpdateCheck` dice que no, no pasa nada.
 -- @param reason string de dónde vino, sólo para el log
 function HighlightsDeToto:_maybeCheckPluginUpdate(reason)
+    if self._closed then return false, "closed" end
     local plan = UpdateCheck.plan(self:_pluginUpdateCheckState(false))
     if not plan.allowed then
         logger.dbg("Borges: plugin update check skipped -",
@@ -3844,6 +4477,7 @@ end
 -- «Actualización disponible» sigue en el menú y el cartel sale la próxima vez
 -- que el lector entre al menú o cierre el libro.
 function HighlightsDeToto:_announcePluginUpdate(reason)
+    if self._closed then return false, "closed" end
     local allowed, why = self:_canAnnouncePluginUpdate(reason)
     if not allowed then
         logger.dbg("Borges: update notice held -", tostring(reason), why)
@@ -4081,6 +4715,7 @@ function HighlightsDeToto:_showSuspendSyncStatus()
 end
 
 function HighlightsDeToto:ensureNetwork(callback)
+    self:_keepWifi()
     if NetworkMgr:isConnected() then
         callback()
     else
@@ -4165,6 +4800,7 @@ function HighlightsDeToto:canPair()
 end
 
 function HighlightsDeToto:startOrResumePairing()
+    self:_keepWifi()
     if self.pairing_state and os.time() >= (self.pairing_state.requested_at or 0)
         + (self.pairing_state.expires_in or 300) then
         self.pairing:stopWatching()
@@ -4323,6 +4959,7 @@ end
 --- La acción principal. Un solo toque hace todo; el segundo, mientras corre,
 -- no hace nada — ni encola otra corrida ni la duplica.
 function HighlightsDeToto:runUnifiedSync()
+    self:_keepWifi()
     if self:isSyncRunning() then
         self:showInfo(_("Already syncing. Wait for it to finish."), 3)
         return
@@ -4860,6 +5497,7 @@ end
 -- fresco: el que se guardó al detectar la versión puede apuntar a hashes que
 -- el servidor ya reemplazó, y esa descarga fallaría sin explicación.
 function HighlightsDeToto:installPendingUpdate()
+    self:_keepWifi()
     if not self:hasPendingUpdate() then
         if self:hasUpdatePendingRestart() then
             self:showInfo(T(
@@ -4947,11 +5585,30 @@ end
 -- Personal Library
 -- ============================================================
 
+-- La biblioteca se pide de a LIBRARY_PAGE_SIZE libros, lo último agregado
+-- primero (así lo ordena el servidor). Menu pagina en pantalla lo que ya bajó;
+-- si el servidor tiene más, la última fila de la lista pide la página siguiente.
+local LIBRARY_PAGE_SIZE = 100
+
+local function formatBookSize(bytes)
+    bytes = tonumber(bytes)
+    if not bytes or bytes <= 0 then return nil end
+    if bytes >= 1024 * 1024 then
+        return string.format("%.1f MB", bytes / (1024 * 1024))
+    end
+    return string.format("%d KB", math.max(1, math.floor(bytes / 1024 + 0.5)))
+end
+
+function HighlightsDeToto:fetchLibraryPage(page)
+    local url = string.format("%s?page=%d&limit=%d", self:getLibraryBooksUrl(), page, LIBRARY_PAGE_SIZE)
+    return self:getApi():getJSON(url, self:getWebAuth())
+end
+
 function HighlightsDeToto:showLibraryDownloadDialog()
     self:ensureNetwork(function()
         local progress = self:showInfoPersist(_("Loading Borges library..."))
         UIManager:nextTick(function()
-            local result, err = self:getApi():getJSON(self:getLibraryBooksUrl(), self:getWebAuth())
+            local result, err = self:fetchLibraryPage(1)
             UIManager:close(progress)
             if not result then
                 self:showInfo(T(_("Library error: %1"), err or _("unknown error")), 8)
@@ -4963,50 +5620,84 @@ function HighlightsDeToto:showLibraryDownloadDialog()
                 self:showInfo(_("No books available on the server."), 5)
                 return
             end
-
-            local lines = {}
-            for i, book in ipairs(books) do
-                if i > 20 then break end
-                local label = book.title or book.original_filename or _("Untitled")
-                if book.author and book.author ~= "" then
-                    label = label .. " - " .. book.author
-                end
-                table.insert(lines, string.format("%d. %s", i, label))
-            end
-
-            local dialog
-            dialog = InputDialog:new{
-                title = _("Download from Borges library"),
-                description = table.concat(lines, "\n") .. "\n\n" .. _("Enter the book number to download."),
-                input_hint = "1",
-                buttons = {
-                    {
-                        {
-                            text = _("Cancel"),
-                            id = "close",
-                            callback = function()
-                                UIManager:close(dialog)
-                            end,
-                        },
-                        {
-                            text = _("Download"),
-                            is_enter_default = true,
-                            callback = function()
-                                local choice = tonumber(dialog:getInputText())
-                                UIManager:close(dialog)
-                                if not choice or not books[choice] then
-                                    self:showInfo(_("Invalid selection."), 4)
-                                    return
-                                end
-                                self:downloadLibraryBook(books[choice])
-                            end,
-                        },
-                    },
-                },
-            }
-            UIManager:show(dialog)
+            self:showLibraryMenu(books, 1, result.has_next == true)
         end)
     end)
+end
+
+function HighlightsDeToto:showLibraryMenu(books, page, has_next)
+    local Menu = require("ui/widget/menu")
+    local Screen = Device.screen
+    local menu
+
+    local function buildItems()
+        local items = {}
+        for _i, book in ipairs(books) do
+            local label = book.title or book.original_filename or _("Untitled")
+            if book.author and book.author ~= "" then
+                label = label .. " - " .. book.author
+            end
+            table.insert(items, {
+                text = label,
+                mandatory = formatBookSize(book.file_size),
+                callback = function() self:confirmLibraryBookDownload(book) end,
+            })
+        end
+        if has_next then
+            table.insert(items, {
+                text = _("Load more books..."),
+                callback = function()
+                    local progress = self:showInfoPersist(_("Loading Borges library..."))
+                    UIManager:nextTick(function()
+                        local result, err = self:fetchLibraryPage(page + 1)
+                        UIManager:close(progress)
+                        if not result then
+                            self:showInfo(T(_("Library error: %1"), err or _("unknown error")), 8)
+                            return
+                        end
+                        local first_new = #books + 1
+                        for _i, book in ipairs(result.books or {}) do
+                            table.insert(books, book)
+                        end
+                        page = page + 1
+                        has_next = result.has_next == true and #(result.books or {}) > 0
+                        menu:switchItemTable(nil, buildItems(), first_new)
+                    end)
+                end,
+            })
+        end
+        return items
+    end
+
+    menu = Menu:new{
+        title = _("Download from Borges library"),
+        item_table = buildItems(),
+        covers_fullscreen = true,
+        is_borderless = true,
+        is_popout = false,
+        width = Screen:getWidth(),
+        height = Screen:getHeight(),
+        -- Sin close_callback a proposito: Menu lo llama despues de cada toque y
+        -- la lista tiene que quedar abierta para bajar otro libro. La X y el
+        -- gesto de cerrar ya la cierran solos (onCloseAllMenus).
+    }
+    UIManager:show(menu)
+end
+
+function HighlightsDeToto:confirmLibraryBookDownload(book)
+    local lines = { book.title or book.original_filename or _("Untitled") }
+    if book.author and book.author ~= "" then
+        table.insert(lines, book.author)
+    end
+    local size = formatBookSize(book.file_size)
+    if size then
+        table.insert(lines, T(_("Size: %1"), size))
+    end
+    UIManager:show(ConfirmBox:new{
+        text = table.concat(lines, "\n"),
+        ok_text = _("Download"),
+        ok_callback = function() self:downloadLibraryBook(book) end,
+    })
 end
 
 function HighlightsDeToto:downloadLibraryBook(book)
