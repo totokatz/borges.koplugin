@@ -8,6 +8,10 @@ release. Una versión sin sección se ofrece igual, sin novedades para mostrar.
 Escribí en criollo y en presente, una línea por cambio, pensando en alguien
 que está por tocar «Actualizar» en un lector de tinta electrónica.
 
+## 2026.11.11.5
+
+- A reader whose syncing had stopped for good after an earlier version saved one change twice now starts syncing again on its own. The stuck change is sent as a new one, and nothing already saved in your account is touched.
+
 ## 2026.11.11.4
 
 - A highlight made on the web or on another reader now appears on the page you are looking at. It was being saved in the book but stayed invisible until you closed the book and opened it again.

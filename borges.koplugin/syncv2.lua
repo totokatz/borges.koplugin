@@ -174,11 +174,20 @@ function SyncV2:sync(force, quick)
     end
 
     local response, err = self.web_api:postJSON(url, self:getAuth(), payload, quick == true)
-    if not response and #events > 0 and type(err) == "table"
-        and err.code == "client_sequence_conflict"
-        and self.queue:recoverSequences(err.details, events) then
-        -- One recovery attempt per batch, never recursive. Accepted events in
-        -- this batch keep their original ID/sequence and receive a duplicate ACK.
+    -- Recuperaciones acotadas: una de secuencias por lote (los aceptados del
+    -- lote conservan id/secuencia y reciben un ACK duplicado) y una por cada
+    -- evento que el servidor nombre en un idempotency_conflict.
+    local sequences_recovered, reissued = false, 0
+    while not response and #events > 0 and type(err) == "table" do
+        local recovered = false
+        if err.code == "client_sequence_conflict" and not sequences_recovered then
+            sequences_recovered = true
+            recovered = self.queue:recoverSequences(err.details, events)
+        elseif err.code == "idempotency_conflict" and reissued < #events then
+            recovered = self.queue:reissueConflicting(err.details, events)
+            if recovered then reissued = reissued + 1 end
+        end
+        if not recovered then break end
         events = self.queue:prepareBatch(nil, nil, true)
         payload.events = events
         response, err = self.web_api:postJSON(url, self:getAuth(), payload, quick == true)

@@ -717,6 +717,40 @@ function Queue:recoverSequences(details, attempted)
     return true
 end
 
+--- El servidor ya guardó OTRO contenido con este id (idempotency_conflict).
+-- Pasa en colas escritas antes de la cola única por proceso (Shared.queue):
+-- una instancia del plugin volcó contenido nuevo en un id que otra ya había
+-- enviado (CNB-EEKNMN16). Lo del servidor es una versión anterior real y no se
+-- toca; lo local es lo más nuevo del lector y viaja con identidad nueva al
+-- final de la cola. Sin esto un solo evento traba el outbox entero para
+-- siempre: cada envío se rechaza en bloque.
+-- Sólo se reidentifica un id que el servidor nombró y que está en este envío.
+function Queue:reissueConflicting(details, attempted)
+    if type(details) ~= "table" then return false end
+    local id = details.client_event_id or details.clientEventId
+    if type(id) ~= "string" then return false end
+    local was_sent = false
+    for _, event in ipairs(attempted or {}) do
+        if event.client_event_id == id then was_sent = true; break end
+    end
+    local index, stored = findById(self.state.outbox, id)
+    if not was_sent or not stored then return false end
+    local sequence = self.state.next_client_sequence
+    for _, event in ipairs(self.state.outbox) do
+        sequence = math.max(sequence, (tonumber(event.client_sequence) or 0) + 1)
+    end
+    table.remove(self.state.outbox, index)
+    logger.warn("Borges: reissuing event the server already holds with other content:", id)
+    stored.client_event_id = self.uuid()
+    stored.client_sequence = string.format("%.0f", sequence)
+    stored._attempts = 0
+    stored._next_attempt_at = 0
+    table.insert(self.state.outbox, stored)
+    self.state.next_client_sequence = sequence + 1
+    self:_save()
+    return true
+end
+
 local function validateAcknowledgements(outbox, acknowledgements)
     local removals, rejected = {}, {}
     for _, ack in ipairs(acknowledgements or {}) do
