@@ -8,6 +8,10 @@ release. Una versión sin sección se ofrece igual, sin novedades para mostrar.
 Escribí en criollo y en presente, una línea por cambio, pensando en alguien
 que está por tocar «Actualizar» en un lector de tinta electrónica.
 
+## 2026.11.11.4
+
+- A highlight made on the web or on another reader now appears on the page you are looking at. It was being saved in the book but stayed invisible until you closed the book and opened it again.
+
 ## 2026.11.11.3
 
 - Highlighting uses far less battery. Saving new highlights used to rewrite the whole synchronization file once per highlight; now a group of highlights is one small save.

@@ -608,12 +608,34 @@ end
 --- KOReader mantiene la lista de anotaciones ordenada y con su numero de
 -- pagina. Despues de aplicar anotaciones de otro lector hay que rehacer las dos
 -- cosas, una vez, antes de que nadie guarde o dibuje la lista.
+--
+-- Y hay que avisarle a la pantalla. KOReader dibuja los subrayados de una
+-- pagina ya visitada desde una cache por pagina (`view.highlight.page_boxes`)
+-- y no vuelve a mirar la lista: un subrayado hecho en la web llegaba al libro
+-- abierto, quedaba guardado en el sidecar y no aparecia nunca en la pagina que
+-- la persona tenia delante (hasta reabrir el libro). KOReader lo resuelve con
+-- el evento AnnotationsModified; aca no se usa porque tambien le pone fecha de
+-- edicion a la anotacion y dispara nuestra propia comparacion. La cache se tira
+-- entera: insertar o borrar corre el indice de todas las cajas guardadas.
 function HighlightsDeToto:_settleAnnotations()
     if not self._annotations_unsettled then return end
     self._annotations_unsettled = false
     local annotation_module = self.ui and self.ui.annotation
     if annotation_module and annotation_module.updateAnnotations then
         annotation_module:updateAnnotations(true, true)
+    end
+    local view = self.ui and self.ui.view
+    if not view then return end
+    if type(view.resetHighlightBoxesCache) == "function" then
+        local ok, err = pcall(view.resetHighlightBoxesCache, view)
+        if not ok then
+            logger.warn("Borges: could not refresh the highlights on screen:", tostring(err))
+        end
+    end
+    -- Con la pantalla de reposo puesta no se dibuja nada encima: al despertar
+    -- KOReader repinta la pagina solo, ya sin la cache vieja.
+    if not self._background_suspended and Device.screen_saver_mode ~= true then
+        UIManager:setDirty(self.ui, "ui")
     end
 end
 
