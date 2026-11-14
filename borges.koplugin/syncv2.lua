@@ -55,8 +55,23 @@ end
 -- equivocado: la posición vieja de este lector llega primero, queda como la
 -- última escritura y la del otro aparato ya no se ofrece. Este pull mira y no
 -- toca: si falla, el outbox queda intacto para el drenaje que viene después.
-function SyncV2:pull(quick, focus_book, focus_only)
-    local reading_context = focus_only and resolve(self.reading_context) or nil
+-- Una consulta enfocada a la vez: quien quiere preguntar mientras otra esta en
+-- vuelo (por ejemplo un envio periodico durante la consulta del despertar)
+-- espera su resultado en vez de cruzarse con ella. `focus_in_flight` lo mira
+-- `_resolveHeldProgress`.
+function SyncV2:pull(quick, focus_book, focus_only, context)
+    if not focus_only then return self:_pull(quick, focus_book, focus_only, context) end
+    self.focus_in_flight = (self.focus_in_flight or 0) + 1
+    self.focus_started_at = os.time()
+    local ok, result, err = pcall(self._pull, self, quick, focus_book, focus_only, context)
+    self.focus_in_flight = math.max(0, self.focus_in_flight - 1)
+    if not ok then error(result, 0) end
+    return result, err
+end
+
+function SyncV2:_pull(quick, focus_book, focus_only, context)
+    -- `context` lo pasa quien consulta un libro que no es el abierto.
+    local reading_context = focus_only and (context or resolve(self.reading_context)) or nil
     local response, err = self.web_api:postJSON(
         self:getBaseUrl() .. "/api/sync/v2/pull",
         self:getAuth(),

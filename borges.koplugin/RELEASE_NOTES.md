@@ -8,6 +8,19 @@ release. Una versión sin sección se ofrece igual, sin novedades para mostrar.
 Escribí en criollo y en presente, una línea por cambio, pensando en alguien
 que está por tocar «Actualizar» en un lector de tinta electrónica.
 
+## 2026.11.14.1
+
+- Turning Wi-Fi off by hand while reading no longer leaves the reader unresponsive. A status message meant for the sleep screen was being drawn over the book, and it swallowed every touch until the reader was put to sleep and woken up again.
+
+## 2026.11.12.2
+
+- Your page now always reaches your other readers. Before sending anything, the reader checks where you last read and sends its own page if that was here. It also does this for books you already closed, with Wi-Fi turned on by hand, and after a connection that failed when waking up.
+- If another reader went further in the meantime, nothing is overwritten: the next time you open that book on this reader, it asks you which page to keep.
+
+## 2026.11.12.1
+
+- With "Wi-Fi only to sync" on, the page you reached is sent again before the reader sleeps. If the connection on waking up failed, highlights and reading time were uploaded but the position was not, so another reader opened the book much further back.
+
 ## 2026.11.11.5
 
 - A reader whose syncing had stopped for good after an earlier version saved one change twice now starts syncing again on its own. The stuck change is sent as a new one, and nothing already saved in your account is touched.

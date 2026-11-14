@@ -542,6 +542,20 @@ function Queue:isProgressHeld(identifier)
     return self.state.progress_holds[progressKey(identifier) or ""] == true
 end
 
+--- Los libros con una posicion retenida que todavia tiene algo para enviar,
+-- uno por libro, en el orden del outbox. Incluye libros ya cerrados.
+function Queue:heldProgressIdentifiers()
+    local seen, list = {}, {}
+    for _, event in ipairs(self.state.outbox) do
+        local key = event.event_type == "progress.changed" and progressKey(event.book_identifier)
+        if key and not seen[key] and self.state.progress_holds[key] then
+            seen[key] = true
+            table.insert(list, { kind = event.book_identifier.kind, value = event.book_identifier.value })
+        end
+    end
+    return list
+end
+
 -- Called before startup workers: restored progress must consult the reading
 -- head again, including books closed before their previous query completed.
 function Queue:holdPendingProgress()

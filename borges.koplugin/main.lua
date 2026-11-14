@@ -128,6 +128,10 @@ local HIGHLIGHT_DEBOUNCE = 300    -- seconds of quiet before checking changed hi
 -- señal) no son dos reconexiones. Sin esta ventana el lector recibe dos
 -- corridas encimadas y, con ellas, dos diálogos.
 local RECONNECT_SYNC_DEBOUNCE = 25
+-- Una posicion retenida se vuelve a consultar a lo sumo una vez por minuto y
+-- por libro mientras haya red; al dormir o al cortarse el Wi-Fi, siempre.
+local HELD_CHECK_INTERVAL = 60
+local HELD_CHECK_MAX_BOOKS = 5
 -- Segundos entre la consulta al servidor y la subida de lo pendiente. No es
 -- una espera decorativa: le da lugar al aviso de posición para llegar a la
 -- pantalla antes de que la cola vieja empiece a viajar.
@@ -1583,6 +1587,7 @@ function HighlightsDeToto:_syncV2Now(quick, max_pages, force)
             true
         )
     end
+    self:_safecall("resolveHeldProgress", function() self:_resolveHeldProgress(false) end)
     local result, err = self.sync_v2:syncAll(force == true, max_pages or 20, quick)
     if result then
         self.last_progress_sync = os.time()
@@ -1610,6 +1615,7 @@ function HighlightsDeToto:_drainQueue(after_pull)
         return self:_runBackgroundSync("drain", function() self:_drainQueue(after_pull) end)
     end
     if not NetworkMgr:isConnected() then return end
+    self:_safecall("resolveHeldProgress", function() self:_resolveHeldProgress(false) end)
     local v2_result, v2_err
     if self.device_token and not (after_pull and self.queue:sendableCount() == 0) then
         v2_result, v2_err = self.sync_v2:sync(false, true)
@@ -1664,6 +1670,9 @@ end
 -- when items succeed, faster when offline (skips immediately).
 function HighlightsDeToto:_drainQueueBlocking(quick)
     if not NetworkMgr:isConnected() then return end
+    -- Es la ultima oportunidad con red (dormir, cortarse el Wi-Fi): una
+    -- posicion retenida pregunta siempre, sin esperar el intervalo.
+    self:_safecall("resolveHeldProgress", function() self:_resolveHeldProgress(true) end)
     -- Sin nada que pueda salir no se hace ningun pedido: antes un outbox vacio
     -- (o con la posicion retenida) costaba igual una consulta al servidor.
     if self.device_token and self.queue:sendableCount() > 0 then
@@ -1730,28 +1739,49 @@ function HighlightsDeToto:_beginReadingHandoff()
     self.queue:holdProgress(self:_bookIdentifier(self.book_hash))
 end
 
-function HighlightsDeToto:_handleReadingHead(response, context)
-    if context and (context.book_hash ~= self.book_hash or context.token ~= self.device_token
-        or context.epoch ~= self._background_epoch) then return nil, "stale_reading_head" end
-    if not self.book_hash or response.reading_head_checked ~= true then
+--- Lo que dice la cabeza de lectura del servidor para `book_hash`: si hay que
+-- preguntar (otro aparato leyo despues y nadie eligio todavia) y el evento.
+function HighlightsDeToto:_readReadingHead(response, book_hash)
+    if not book_hash or response.reading_head_checked ~= true then
         return nil, "reading_head_unavailable"
     end
     local event = response.focus_event
-    local head = { book_hash = self.book_hash, token = self.device_token, ask = false }
-    if event ~= nil and event ~= rapidjson.null then
-        local identifier = type(event) == "table" and event.book_identifier
-        local source = type(event) == "table" and event.origin_device
-        if not identifier or identifier.value ~= self.book_hash or identifier.kind ~= "koreader_partial_md5"
-            or not source or not source.id or not event.event_id
-            or not event.directive_metadata or event.directive_metadata.reading_head ~= true then
-            return nil, "reading_head_invalid"
-        end
-        head.event_id = event.event_id
-        local own = source.id == self.paired_device_id or source.id == self.device_id
-        local chosen = self.resume_flow:hasLocalChoice(self.book_hash, event,
-            self.paired_device_id or self.device_id)
-        head.ask = not own and not chosen
+    if event == nil or event == rapidjson.null then return { ask = false } end
+    local identifier = type(event) == "table" and event.book_identifier
+    local source = type(event) == "table" and event.origin_device
+    if not identifier or identifier.value ~= book_hash or identifier.kind ~= "koreader_partial_md5"
+        or not source or not source.id or not event.event_id
+        or not event.directive_metadata or event.directive_metadata.reading_head ~= true then
+        return nil, "reading_head_invalid"
     end
+    local own = source.id == self.paired_device_id or source.id == self.device_id
+    local chosen = self.resume_flow:hasLocalChoice(book_hash, event,
+        self.paired_device_id or self.device_id)
+    return { ask = not own and not chosen, event_id = event.event_id }
+end
+
+function HighlightsDeToto:_handleReadingHead(response, context)
+    if context and context.closed then
+        -- Un libro que ya no esta abierto: nadie puede elegir ahora. Si la
+        -- ultima lectura es de este lector, su posicion sale; si es de otro,
+        -- sigue retenida y se pregunta al abrir ese libro.
+        if context.token ~= self.device_token or context.epoch ~= self._background_epoch then
+            return nil, "stale_reading_head"
+        end
+        local found, reason = self:_readReadingHead(response, context.book_hash)
+        if not found then return nil, reason end
+        if not found.ask then
+            self.queue:releaseProgress(self:_bookIdentifier(context.book_hash))
+        end
+        logger.info("Borges: last reading checked for a closed book; still held:", found.ask)
+        return true
+    end
+    if context and (context.book_hash ~= self.book_hash or context.token ~= self.device_token
+        or context.epoch ~= self._background_epoch) then return nil, "stale_reading_head" end
+    local found, reason = self:_readReadingHead(response, self.book_hash)
+    if not found then return nil, reason end
+    local head = { book_hash = self.book_hash, token = self.device_token,
+        ask = found.ask, event_id = found.event_id }
     self._reading_head = head
     logger.info("Borges: last reading checked; choice required:", head.ask)
     if not head.ask then self.queue:releaseProgress(self:_bookIdentifier(self.book_hash)) end
@@ -2382,7 +2412,11 @@ function HighlightsDeToto:_uploadBeforeSleep()
     Shared.wifi_auto_closed, Shared.wifi_quiet_failed, Shared.wifi_quiet = false, false, nil
     if not (closed_here or quiet_failed) or not self:_wifiOnlyToSyncActive() or not self.device_token then return end
     if NetworkMgr:isWifiOn() then return end
-    if self.queue:sendableCount() == 0 then return end
+    -- Una posicion retenida cuenta: es justo lo que este envio tiene que
+    -- poder soltar (ver `_resolveHeldProgress`, que corre en el drenaje).
+    -- Tambien la de un libro ya cerrado.
+    local held = #self.queue:heldProgressIdentifiers() > 0
+    if self.queue:sendableCount() == 0 and not held then return end
 
     logger.info("Borges: turning Wi-Fi on to upload this reading before sleep")
     Shared.wifi_edge = true
@@ -2415,6 +2449,55 @@ function HighlightsDeToto:_uploadBeforeSleep()
             pcall(Device.rescheduleSuspend, Device, SLEEP_UPLOAD_WINDOW)
         end
     end)
+end
+
+--- Red de seguridad general (12 nov 2026). Una posicion retenida solo se
+-- suelta con la consulta de la ultima lectura, y esa consulta dependia de que
+-- un despertar, una apertura o una conexion la hiciera justo bien: una falla
+-- transitoria, una reconexion dentro del debounce, una conexion que llego
+-- despues del timeout, un libro cerrado o el Wi-Fi prendido a mano al dormir
+-- la dejaban retenida para siempre. Ahora todo envio pregunta antes por cada
+-- libro retenido, el abierto o uno cerrado. La regla no cambia: la consulta
+-- decide, y una lectura mas nueva en otro aparato la mantiene retenida.
+-- `force` saltea el intervalo: al dormir o al cortarse el Wi-Fi es la ultima
+-- oportunidad.
+function HighlightsDeToto:_resolveHeldProgress(force)
+    if not self.device_token or not self.sync_v2 or not self.queue then return 0 end
+    if not NetworkMgr:isConnected() then return 0 end
+    -- Otra consulta de la ultima lectura esta en vuelo: su resultado decide.
+    -- Con vencimiento: una corrutina cancelada a mitad de pedido no baja el
+    -- contador, y eso no puede apagar esta red de seguridad para siempre.
+    if (self.sync_v2.focus_in_flight or 0) > 0
+        and os.time() - (self.sync_v2.focus_started_at or 0) < HELD_CHECK_INTERVAL * 2 then
+        return 0
+    end
+    local held = self.queue:heldProgressIdentifiers()
+    if #held == 0 then return 0 end
+    local now = os.time()
+    self._held_checked_at = self._held_checked_at or {}
+    local checked = 0
+    for _, identifier in ipairs(held) do
+        if checked >= HELD_CHECK_MAX_BOOKS then break end
+        local key = identifier.kind .. ":" .. tostring(identifier.value)
+        local last = self._held_checked_at[key]
+        local open = identifier.value == self.book_hash
+        -- Con una eleccion en pantalla, o la consulta de conexion en curso, el
+        -- libro abierto ya esta preguntando: otra consulta la invalidaria.
+        local busy = open and ((self._reading_head and self._reading_head.ask) or self._connect_sync_running)
+        if not busy and (force or not last or now - last >= HELD_CHECK_INTERVAL) then
+            self._held_checked_at[key] = now
+            checked = checked + 1
+            local context = not open and { book_hash = identifier.value, token = self.device_token,
+                epoch = self._background_epoch, closed = true } or nil
+            local ok, err = self.sync_v2:pull(true, identifier, true, context)
+            if not ok then
+                logger.warn("Borges: last reading not confirmed, position stays held:", tostring(err))
+            end
+        end
+    end
+    -- Dormido no se pregunta nada: la eleccion pendiente espera al despertar.
+    if checked > 0 and self._background_suspended then self:_clearReadingHead() end
+    return checked
 end
 
 --- Called when a book is opened and ready to read.
@@ -4727,6 +4810,11 @@ end
 
 function HighlightsDeToto:_showSuspendSyncStatus()
     if not self:isWebConfigured() then return end
+    -- El cartel es para el protector de pantalla y nada mas: ocupa toda la
+    -- pantalla y solo lo saca onResume. Con el libro abierto (la persona apago
+    -- el Wi-Fi desde el menu) quedaba arriba de la pila de widgets y se tragaba
+    -- cada toque hasta el proximo despertar: el lector parecia colgado.
+    if Device.screen_saver_mode ~= true then return end
 
     local pending = self.queue:count()
     if pending == 0 then
