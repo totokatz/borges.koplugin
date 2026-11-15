@@ -26,8 +26,14 @@ local STATE_VERSION = 3
 local INBOX_FORMAT = "borges-inbox-1"
 local ANNOTATION_FORMAT = "borges-annotations-1"
 local SHARD_DIR = "highlightsdetoto_sync_v2"
-local DEFAULT_MAX_EVENTS = 20
+-- Lote en segundo plano. El servidor acepta hasta 100 eventos y 256 KiB por
+-- intercambio (`server/lib/syncV2Contract.js`); el tope de bytes queda por
+-- debajo para el sobre del pedido. Con 20 un atraso de 125 eventos eran siete
+-- intercambios, cada uno con su saludo TLS.
+local DEFAULT_MAX_EVENTS = 100
 local DEFAULT_MAX_BYTES = 240 * 1024
+Queue.DEFAULT_MAX_EVENTS = DEFAULT_MAX_EVENTS
+Queue.DEFAULT_MAX_BYTES = DEFAULT_MAX_BYTES
 local MAX_REJECTED = 50
 -- Tope de lo que espera a su libro. Con una sola entrada por anotacion (ver
 -- `inboxSlot`) el numero es "anotaciones ajenas distintas en libros sin abrir".
@@ -172,6 +178,16 @@ local function normalizeState(value)
     state.resume_decisions = type(state.resume_decisions) == "table"
         and state.resume_decisions or {}
     state.progress_holds = type(state.progress_holds) == "table" and state.progress_holds or {}
+    -- F5 · Claves de libro vistas para cada hash (ver bookkey.lua) y cuantas
+    -- entradas vivas de cada hash no adopto ningun libro todavia.
+    state.book_keys = type(state.book_keys) == "table" and state.book_keys or {}
+    state.unadopted = type(state.unadopted) == "table" and state.unadopted or {}
+    -- Tanda final · clave -> claves anteriores del MISMO libro (renombres).
+    -- Sin renombres no se guarda nada (ni una tabla vacia en cada escritura).
+    state.key_lineage = type(state.key_lineage) == "table" and next(state.key_lineage) ~= nil
+        and state.key_lineage or nil
+    -- Subrayados rechazados que la proxima comparacion va a volver a mandar.
+    state.reemit_pending = type(state.reemit_pending) == "table" and state.reemit_pending or {}
     state.last_error = type(state.last_error) == "table" and state.last_error or nil
     return state
 end
@@ -522,35 +538,64 @@ end
 -- una sola escritura atomica). Un corte antes de eso no pierde nada: al
 -- arrancar, `holdPendingProgress` vuelve a retener toda posicion pendiente.
 -- Antes eran dos escrituras con fsync en cada despertar y cada apertura.
-function Queue:holdProgress(identifier)
-    local key = progressKey(identifier)
+-- F5 · Una retencion es por libro: la clave local del libro si se sabe
+-- (bookkey.lua), y si no `kind:value` como antes. Dos libros con el mismo hash
+-- ya no se retienen ni se sueltan juntos.
+local function holdKey(identifier, book_key)
+    if type(book_key) == "string" and book_key ~= "" then return book_key end
+    return progressKey(identifier)
+end
+
+local function eventHoldKey(event)
+    return holdKey(event.book_identifier, event._book_key)
+end
+
+function Queue:holdProgress(identifier, book_key)
+    local key = holdKey(identifier, book_key)
+    -- Ni siquiera marca el estado como cambiado: sale con el proximo guardado
+    -- que de verdad haga falta. Marcarlo hacia que la consulta del despertar
+    -- reescribiera el estado principal (con el outbox entero) solo para
+    -- anotar una retencion que `holdPendingProgress` reconstruye al arrancar.
     if key and not self.state.progress_holds[key] then
         self.state.progress_holds[key] = true
-        self:_save(true)
     end
 end
 
-function Queue:releaseProgress(identifier)
-    local key = progressKey(identifier)
-    if key and self.state.progress_holds[key] then
-        self.state.progress_holds[key] = nil
-        self:_save(true)
+--- Soltar la de este libro. Con la clave, tambien la retencion por hash de
+-- antes de la clave (posiciones encoladas por una version anterior): la
+-- consulta que la suelta es la misma.
+function Queue:releaseProgress(identifier, book_key)
+    -- Igual que retener: no ensucia el estado. Si se corta la corriente antes
+    -- del proximo guardado, al arrancar se vuelve a retener y a preguntar:
+    -- trabajo repetido, nunca una posicion que pise otra lectura.
+    for _, key in ipairs({ holdKey(identifier, book_key), progressKey(identifier) }) do
+        if key and self.state.progress_holds[key] then
+            self.state.progress_holds[key] = nil
+        end
     end
 end
 
-function Queue:isProgressHeld(identifier)
-    return self.state.progress_holds[progressKey(identifier) or ""] == true
+function Queue:isProgressHeld(identifier, book_key)
+    return self.state.progress_holds[holdKey(identifier, book_key) or ""] == true
 end
 
 --- Los libros con una posicion retenida que todavia tiene algo para enviar,
--- uno por libro, en el orden del outbox. Incluye libros ya cerrados.
+-- uno por libro, en el orden del outbox. Incluye libros ya cerrados. Cada uno
+-- lleva su clave de libro y la pista (titulo y archivo) del progreso retenido,
+-- para preguntar por ESE libro aunque comparta hash con otro.
 function Queue:heldProgressIdentifiers()
     local seen, list = {}, {}
     for _, event in ipairs(self.state.outbox) do
-        local key = event.event_type == "progress.changed" and progressKey(event.book_identifier)
+        local key = event.event_type == "progress.changed" and eventHoldKey(event)
         if key and not seen[key] and self.state.progress_holds[key] then
             seen[key] = true
-            table.insert(list, { kind = event.book_identifier.kind, value = event.book_identifier.value })
+            local payload = type(event.payload) == "table" and event.payload or {}
+            local hint
+            if type(payload.title) == "string" or type(payload.file) == "string" then
+                hint = { title = payload.title, file = payload.file }
+            end
+            table.insert(list, { kind = event.book_identifier.kind, value = event.book_identifier.value,
+                book_key = event._book_key, hint = hint })
         end
     end
     return list
@@ -560,14 +605,14 @@ end
 -- head again, including books closed before their previous query completed.
 function Queue:holdPendingProgress()
     local changed = false
-    local function hold(identifier)
-        local key = progressKey(identifier)
+    local function hold(identifier, book_key)
+        local key = holdKey(identifier, book_key)
         if key and not self.state.progress_holds[key] then
             self.state.progress_holds[key], changed = true, true
         end
     end
     for _, event in ipairs(self.state.outbox) do
-        if event.event_type == "progress.changed" then hold(event.book_identifier) end
+        if event.event_type == "progress.changed" then hold(event.book_identifier, event._book_key) end
     end
     for _, item in ipairs(self.legacy_store:readSetting("pending") or {}) do
         if item.type == "progress" then
@@ -608,20 +653,50 @@ function Queue:enqueueEvent(event, options)
     assert(type(event.aggregate_id) == "string", "aggregate_id is required")
     assert(type(event.payload) == "table", "payload is required")
 
+    -- Un servidor que ya dijo no conocer este tipo opcional no lo va a conocer
+    -- en el próximo intercambio: no se encola (y no cuesta un 422 por sueño)
+    -- hasta que pase un día, por si el servidor se actualizó.
+    local refused = Queue.OPTIONAL_EVENT_TYPES[event.event_type]
+        and type(self.state.unsupported_optional) == "table"
+        and tonumber(self.state.unsupported_optional[event.event_type])
+    if refused and (self.now() - refused) < Queue.UNSUPPORTED_RETRY_SECONDS then
+        self.state.optional_dropped = (tonumber(self.state.optional_dropped) or 0) + 1
+        return nil, "unsupported_optional"
+    end
+
     if options.coalesce_unattempted then
         for index = #self.state.outbox, 1, -1 do
             local existing = self.state.outbox[index]
             if existing.event_type == event.event_type
                 and existing.aggregate_type == event.aggregate_type
                 and existing.aggregate_id == event.aggregate_id
-                and (tonumber(existing._attempts) or 0) == 0 then
+                and (tonumber(existing._attempts) or 0) == 0
+                -- Dos libros pueden compartir el hash de KOReader: con la clave
+                -- local de cada uno, la posicion de uno no pisa la del otro.
+                and not (type(existing._book_key) == "string" and type(event._book_key) == "string"
+                    and existing._book_key ~= event._book_key) then
                 existing.document_id = event.document_id
                 existing.book_identifier = event.book_identifier
                 existing.occurred_at = event.occurred_at or utcNow()
                 existing.time_precision = event.time_precision or "exact"
                 existing.monotonic_ms = event.monotonic_ms
                     and tostring(event.monotonic_ms) or nil
+                -- F6 · Con que metodo se llego a esta posicion (indice, busqueda,
+                -- enlace): un salto encolado sin red que la posicion siguiente
+                -- reemplaza antes de salir no lo pierde. La nueva manda si trae
+                -- el suyo; es el mismo libro (misma clave o una sola sin clave).
+                local old_locator = type(existing.payload) == "table" and existing.payload.locator
+                local arrived_by = type(old_locator) == "table" and old_locator.arrived_by
+                if arrived_by and type(event.payload) == "table" then
+                    local locator = event.payload.locator
+                    if type(locator) ~= "table" then
+                        locator = { v = old_locator.v, locations = {} }
+                        event.payload.locator = locator
+                    end
+                    if locator.arrived_by == nil then locator.arrived_by = arrived_by end
+                end
                 existing.payload = event.payload
+                if type(event._book_key) == "string" then existing._book_key = event._book_key end
                 self:_save(options.defer)
                 return copyWireEvent(existing), true
             end
@@ -643,6 +718,8 @@ function Queue:enqueueEvent(event, options)
         time_precision = event.time_precision or "exact",
         monotonic_ms = event.monotonic_ms and tostring(event.monotonic_ms) or nil,
         payload = event.payload,
+        -- Campo local: `copyWireEvent` no lo copia, no viaja al servidor.
+        _book_key = type(event._book_key) == "string" and event._book_key or nil,
         _attempts = 0,
         _next_attempt_at = 0,
         _enqueued_at = self.now(),
@@ -654,28 +731,54 @@ function Queue:enqueueEvent(event, options)
     return copyWireEvent(stored)
 end
 
-function Queue:prepareBatch(max_events, max_bytes, force)
+--- Elegir el proximo lote. `options.priority` es una lista de `event_type` que
+-- se eligen primero (en orden de outbox, un tipo detras del otro) antes de
+-- recorrer el resto: al dormir la posicion y la sesion no esperan detras de
+-- cien subrayados. Las reglas son las mismas en las dos pasadas (retencion,
+-- espera, bytes) y elegir no descarta nada: lo que no entra queda en el outbox.
+function Queue:prepareBatch(max_events, max_bytes, force, options)
     max_events = max_events or DEFAULT_MAX_EVENTS
     max_bytes = max_bytes or DEFAULT_MAX_BYTES
     local now = self.now()
-    local selected = {}
+    local selected, chosen = {}, {}
+    local full = false
 
-    for _, event in ipairs(self.state.outbox) do
-        if #selected >= max_events then break end
-        local held = event.event_type == "progress.changed" and self:isProgressHeld(event.book_identifier)
-        if not held and (force or (tonumber(event._next_attempt_at) or 0) <= now) then
-            local candidate = copyWireEvent(event)
-            table.insert(selected, candidate)
-            local encoded = rapidjson.encode({
-                protocol_version = 2,
-                cursor = self.state.applied_cursor,
-                events = selected,
-            })
-            if #encoded > max_bytes then
-                table.remove(selected)
-                break
-            end
+    local function consider(event)
+        if full or chosen[event.client_event_id] then return end
+        if #selected >= max_events then full = true; return end
+        local held = event.event_type == "progress.changed" and self:isProgressHeld(event.book_identifier, event._book_key)
+        if held or not (force or (tonumber(event._next_attempt_at) or 0) <= now) then return end
+        table.insert(selected, copyWireEvent(event))
+        local encoded = rapidjson.encode({
+            protocol_version = 2,
+            cursor = self.state.applied_cursor,
+            events = selected,
+        })
+        if #encoded > max_bytes then
+            table.remove(selected)
+            full = true
+            return
         end
+        chosen[event.client_event_id] = true
+    end
+
+    local priority = type(options) == "table" and type(options.priority) == "table" and options.priority or {}
+    for _, kind in ipairs(priority) do
+        for _, event in ipairs(self.state.outbox) do
+            if full then break end
+            if event.event_type == kind then consider(event) end
+        end
+    end
+    local optional = Queue.OPTIONAL_EVENT_TYPES or {}
+    for _, event in ipairs(self.state.outbox) do
+        if full then break end
+        if not optional[event.event_type] then consider(event) end
+    end
+    -- La captura (tramos de lectura y demas) va al final: nunca le saca lugar
+    -- a la posicion, la sesion ni los subrayados (enmienda 3.3).
+    for _, event in ipairs(self.state.outbox) do
+        if full then break end
+        if optional[event.event_type] then consider(event) end
     end
 
     if #selected == 0 then return {} end
@@ -765,6 +868,202 @@ function Queue:reissueConflicting(details, attempted)
     return true
 end
 
+-- F5 · Que hacer con un subrayado que el servidor rechazo.
+--   reemitir: el servidor no pudo ubicar el libro (todavia). Se borra la huella
+--             para que la proxima comparacion lo vuelva a mandar, a lo sumo
+--             REEMIT_LIMIT veces: un rechazo que se repite siempre no puede
+--             costar un pedido por comparacion para siempre.
+--   reidentificar: el id ya lo usa otro subrayado de otro libro (un id derivado
+--             que se repitio). La proxima comparacion le da uno nuevo.
+--   cualquier otro: queda anotado y a la vista en «Estado y ayuda».
+-- Un borrado rechazado no toca nada: un `annotation_delete_other_book` es
+-- justamente un borrado falso.
+Queue.REEMIT_REJECTION_CODES = { book_identity_ambiguous = true, book_identity_unresolved = true }
+Queue.REEMIT_LIMIT = 3
+Queue.REIDENTIFY_REJECTION_CODES = { annotation_sync_id_collision = true }
+local REJECTION_UPSERTS = {
+    ["annotation.created"] = true, ["annotation.updated"] = true, ["bookmark.upserted"] = true,
+}
+
+function Queue:_noteRejection(item, event)
+    item.action = "kept"
+    if type(event) ~= "table" or not REJECTION_UPSERTS[event.event_type] then return end
+    local payload = type(event.payload) == "table" and event.payload or {}
+    local sync_id = payload.sync_id or event.aggregate_id
+    local identifier = event.book_identifier
+    local hash = type(identifier) == "table" and identifier.value or nil
+    if type(sync_id) ~= "string" then return end
+    local key = event._book_key
+    if not key and hash then
+        local book = type(payload.book) == "table" and payload.book or {}
+        key = require("bookkey").fromParts(hash, book.file, book.title)
+    end
+    -- Un evento de una version anterior quedo anotado por hash.
+    local state = key and self:_book(key)
+    if not (state and state[sync_id] ~= nil) and hash and self:_book(hash) and self:_book(hash)[sync_id] ~= nil then
+        key, state = hash, self:_book(hash)
+    end
+    item.book_key = key
+    local entry = state and state[sync_id]
+    if type(entry) ~= "table" then return end
+    local code = item.code
+    if entry.rejected_event == event.client_event_id then
+        -- El mismo rechazo otra vez (un corte de corriente antes de guardar
+        -- el cursor): ya esta contado.
+        item.action = entry.rejected_action or "kept"
+        -- El libro llego al disco y el estado principal no: lo pendiente se
+        -- vuelve a anotar aca.
+        if item.action == "reemit" and entry.fingerprint == nil then
+            self.state.reemit_pending[key .. "|" .. sync_id] = true
+        end
+        return
+    end
+    entry.rejected = code
+    entry.rejected_event = event.client_event_id
+    local reemit = tonumber(entry.reemit) or 0
+    if Queue.REEMIT_REJECTION_CODES[code] and reemit < Queue.REEMIT_LIMIT then
+        entry.fingerprint = nil
+        entry.reemit = reemit + 1
+        item.action = "reemit"
+        self.state.reemit_pending[key .. "|" .. sync_id] = true
+    elseif Queue.REIDENTIFY_REJECTION_CODES[code] then
+        entry.reidentify = true
+        item.action = "reidentify"
+    end
+    entry.rejected_action = item.action
+    self._books[key] = state
+    self._dirty.books[key] = true
+    -- El libro se pudo mudar de clave (renombre) con el evento todavia en
+    -- vuelo: la clave nueva adopto la entrada CON huella y su comparacion no
+    -- lo reenviaria nunca. El reenvio se propaga SOLO a las claves del mismo
+    -- libro (las de su linaje de renombres), nunca a otro libro del mismo
+    -- hash. Y `reidentify` no se propaga nunca: cambiarle el id al subrayado
+    -- de otra clave podria quitarselo a su dueno legitimo en el servidor.
+    if item.action == "reemit" then
+        for _, other in ipairs(self:_sameBookKeys(key)) do
+            local other_state = self:_book(other)
+            local copy = other_state and other_state[sync_id]
+            if type(copy) == "table" and copy.present ~= false and copy.rejected_event ~= event.client_event_id then
+                copy.rejected, copy.rejected_event, copy.rejected_action = code, event.client_event_id, item.action
+                copy.fingerprint = nil
+                copy.reemit = math.max(tonumber(copy.reemit) or 0, entry.reemit)
+                self.state.reemit_pending[other .. "|" .. sync_id] = true
+                self._dirty.books[other] = true
+            end
+        end
+    end
+end
+
+--- Las OTRAS claves del mismo libro que `key`: sus nombres anteriores y los
+-- posteriores (el linaje que anota la adopcion en un renombre).
+function Queue:_sameBookKeys(key)
+    local lineage = self.state.key_lineage or {}
+    local seen, queue, out = { [key] = true }, { key }, {}
+    while #queue > 0 do
+        local current = table.remove(queue)
+        local neighbours = {}
+        for _, older in ipairs(lineage[current] or {}) do table.insert(neighbours, older) end
+        for newer, olders in pairs(lineage) do
+            for _, older in ipairs(olders) do
+                if older == current then table.insert(neighbours, newer) end
+            end
+        end
+        for _, other in ipairs(neighbours) do
+            if not seen[other] then
+                seen[other] = true
+                table.insert(out, other)
+                table.insert(queue, other)
+            end
+        end
+    end
+    return out
+end
+
+--- Cuanto esta corrido el reloj del lector (servidor menos lector, en
+-- segundos), de la ultima respuesta. Diferido: sale con el guardado del
+-- intercambio que la trajo. Cambios de menos de un minuto no se anotan.
+function Queue:setClockSkew(seconds)
+    seconds = tonumber(seconds)
+    if not seconds then return end
+    seconds = math.floor(seconds + 0.5)
+    local previous = tonumber(self.state.clock_skew)
+    if previous and math.abs(previous - seconds) < 60 then return end
+    self.state.clock_skew = seconds
+    self:_save(true)
+end
+
+function Queue:getClockSkew()
+    return tonumber(self.state.clock_skew)
+end
+
+--- Lo que muestra «Estado y ayuda» de los rechazos.
+function Queue:rejectionSummary()
+    local last = self.state.rejected[#self.state.rejected]
+    local kept, pending = 0, 0
+    for _, item in ipairs(self.state.rejected) do
+        if item.action == "kept" then kept = kept + 1 end
+    end
+    for _ in pairs(self.state.reemit_pending) do pending = pending + 1 end
+    return { last_code = last and last.code or nil, pending_reemit = pending, kept = kept }
+end
+
+--- Eventos de captura (enmienda 3.2 del indice de planes): datos para el
+-- servidor y la web que un servidor viejo puede no conocer. Si los rechaza por
+-- desconocidos se descartan y se cuentan; nunca traban la posicion ni los
+-- subrayados (el lote es atomico: uno desconocido frenaba el outbox entero).
+Queue.UNSUPPORTED_RETRY_SECONDS = 24 * 60 * 60
+Queue.OPTIONAL_EVENT_TYPES = {
+    ["reading_span.recorded"] = true,
+    ["device_state.recorded"] = true,
+    ["lookup.recorded"] = true,
+    ["link.followed"] = true,
+    ["selection.recorded"] = true,
+}
+
+local UNSUPPORTED_CODES = { unsupported_event_type = true, unsupported_event_version = true }
+
+--- `details` es la lista de errores de un `validation_failed`. Solo si TODOS
+-- son "tipo o version que no conozco" sobre eventos opcionales de este envio,
+-- esos eventos salen del outbox (y se cuentan) y devuelve true. Con cualquier
+-- otro error no toca nada.
+function Queue:dropUnsupportedOptional(details, attempted)
+    if type(details) ~= "table" or #details == 0 or type(attempted) ~= "table" then return false end
+    local doomed, ids = {}, {}
+    for _, issue in ipairs(details) do
+        if type(issue) ~= "table" or not UNSUPPORTED_CODES[issue.code] then return false end
+        local position = type(issue.path) == "string" and tonumber(issue.path:match("^events%[(%d+)%]"))
+        local wire = position and attempted[position + 1]
+        if not wire or not Queue.OPTIONAL_EVENT_TYPES[wire.event_type] then return false end
+        if not doomed[wire.client_event_id] then
+            doomed[wire.client_event_id] = true
+            table.insert(ids, wire.client_event_id)
+        end
+    end
+    local removed = 0
+    self.state.unsupported_optional = type(self.state.unsupported_optional) == "table"
+        and self.state.unsupported_optional or {}
+    for _, issue in ipairs(details) do
+        local position = tonumber(issue.path:match("^events%[(%d+)%]"))
+        self.state.unsupported_optional[attempted[position + 1].event_type] = self.now()
+    end
+    for _, id in ipairs(ids) do
+        local index = findById(self.state.outbox, id)
+        if index then
+            table.remove(self.state.outbox, index)
+            removed = removed + 1
+        end
+    end
+    if removed == 0 then return false end
+    self.state.optional_dropped = (tonumber(self.state.optional_dropped) or 0) + removed
+    logger.warn("Borges: dropped optional events the server does not support:", removed)
+    self:_save()
+    return true
+end
+
+function Queue:optionalDroppedCount()
+    return tonumber(self.state.optional_dropped) or 0
+end
+
 local function validateAcknowledgements(outbox, acknowledgements)
     local removals, rejected = {}, {}
     for _, ack in ipairs(acknowledgements or {}) do
@@ -786,6 +1085,7 @@ local function validateAcknowledgements(outbox, acknowledgements)
                     code = ack.rejection_code,
                     detail = ack.rejection_detail,
                     server_sequence = ack.server_sequence,
+                    _event = event,
                 })
             end
         end
@@ -841,6 +1141,13 @@ function Queue:commitExchange(response, apply_event)
     end
     self.state.outbox = kept
     for _, item in ipairs(rejected) do
+        local event = item._event
+        item._event = nil
+        -- Lo que el rechazo le hace a lo ya sincronizado del libro va con
+        -- `defer` y sale en el MISMO guardado "consume" de abajo: el libro
+        -- antes que el outbox sin el evento.
+        local ok, err = pcall(self._noteRejection, self, item, event)
+        if not ok then logger.warn("Borges: could not note a rejection:", tostring(err)) end
         item.recorded_at = self.now()
         boundedAppend(self.state.rejected, item, MAX_REJECTED)
     end
@@ -858,9 +1165,16 @@ function Queue:commitExchange(response, apply_event)
         end
         self:_inboxChanged()
     end
-    self.state.applied_cursor = tostring(pull.cursor)
+    -- El estado principal (que lleva el outbox entero) se reescribe solo si
+    -- algo suyo cambio. Una consulta que no trae nada ni mueve el cursor no
+    -- cuesta una escritura: con un outbox atrasado eran ~130 KB por consulta.
+    local cursor = tostring(pull.cursor)
+    if next(removals) ~= nil or #rejected > 0 or cursor ~= self.state.applied_cursor
+        or self.state.last_error ~= nil then
+        self._dirty.main = true
+    end
+    self.state.applied_cursor = cursor
     self.state.last_error = nil
-    self._dirty.main = true
     -- Un solo guardado para todo el intercambio, incluido lo que `apply_event`
     -- dejo pendiente: primero lo aplicado, al final el cursor.
     self:flush("consume")
@@ -918,6 +1232,122 @@ function Queue:getAnnotationState(book_hash)
     return self:_book(book_hash) or {}
 end
 
+--- ¿Hay estado guardado (y vigente) bajo esta clave? Un mapa vacio cuenta: es
+-- un libro ya mudado que todavia no tenia nada sincronizado.
+function Queue:hasAnnotationState(key)
+    if type(key) ~= "string" or key == "" then return false end
+    return self:_book(key) ~= nil
+end
+
+--- Donde puede estar lo ya sincronizado de los libros de este hash: el archivo
+-- por hash de antes de la clave de libro, y las claves ya vistas para el hash.
+function Queue:annotationKeysForHash(book_hash)
+    if type(book_hash) ~= "string" or book_hash == "" then return {} end
+    local keys = { book_hash }
+    local known = self.state.book_keys[book_hash]
+    if type(known) == "table" then
+        for _, key in ipairs(known) do
+            if type(key) == "string" and key ~= book_hash then table.insert(keys, key) end
+        end
+    end
+    return keys
+end
+
+function Queue:rememberBookKey(book_hash, key)
+    if type(book_hash) ~= "string" or type(key) ~= "string" or book_hash == "" or key == "" then return false end
+    local known = self.state.book_keys[book_hash]
+    if type(known) ~= "table" then known = {}; self.state.book_keys[book_hash] = known end
+    for _, existing in ipairs(known) do
+        if existing == key then return false end
+    end
+    table.insert(known, key)
+    self:_save(true)
+    return true
+end
+
+local function entryRevision(entry)
+    return type(entry) == "table" and tonumber(entry.revision) or 0
+end
+
+local function entryLive(entry)
+    return entry ~= nil and (type(entry) ~= "table" or entry.present ~= false)
+end
+
+--- Copiar a `key` lo de las fuentes que este libro reconoce como suyo (`ids`,
+-- del sidecar del libro abierto). Entre dos fuentes con el mismo id gana la de
+-- revision mayor. Las fuentes no se tocan: si hay dos libros con el mismo hash,
+-- el otro todavia necesita lo suyo. No escribe: sale con el proximo `flush`,
+-- en el orden de siempre, y si la corriente se corta antes la proxima apertura
+-- repite la mudanza (es idempotente). Lo vivo que quedo sin adoptar se cuenta
+-- por hash, para el diagnostico.
+-- @return number entradas adoptadas
+function Queue:adoptAnnotationState(key, sources, ids, book_hash)
+    assert(type(key) == "string" and key ~= "", "key is required")
+    ids = type(ids) == "table" and ids or {}
+    local adopted, chosen, left, chosen_from = {}, {}, {}, {}
+    for _, source in ipairs(type(sources) == "table" and sources or {}) do
+        if source ~= key then
+            for id, entry in pairs(self:_book(source) or {}) do
+                if ids[id] and entryLive(entry) then
+                    if chosen[id] == nil or entryRevision(entry) > entryRevision(chosen[id]) then
+                        chosen[id] = entry
+                        chosen_from[id] = source
+                    end
+                elseif entryLive(entry) then
+                    left[id] = true
+                end
+            end
+        end
+    end
+    local count = 0
+    for id, entry in pairs(chosen) do
+        local copy = entry
+        if type(entry) == "table" then
+            copy = {}
+            for field, value in pairs(entry) do copy[field] = value end
+        end
+        adopted[id] = copy
+        count = count + 1
+    end
+    -- Sin nada que adoptar no se crea el archivo: un libro nuevo no cuesta una
+    -- escritura por abrirlo, y la mudanza (que no escribe ni manda nada) se
+    -- repite en memoria hasta que el libro tenga algo propio.
+    if count > 0 then
+        self._books[key] = adopted
+        self._dirty.books[key] = true
+    end
+    -- De que claves de LIBRO (no del hash) vino lo adoptado: son nombres
+    -- anteriores de este mismo libro (un renombre). Es lo unico que dice que
+    -- dos claves son el mismo libro; dos libros del mismo hash adoptan del
+    -- archivo por hash, nunca uno del otro.
+    local hash_source = book_hash or (type(sources) == "table" and sources[1])
+    local lineage = self.state.key_lineage and self.state.key_lineage[key]
+    for _, source in pairs(chosen_from) do
+        if source ~= hash_source then
+            lineage = lineage or {}
+            local known = false
+            for _, existing in ipairs(lineage) do if existing == source then known = true end end
+            if not known then
+                table.insert(lineage, source)
+                self.state.key_lineage = self.state.key_lineage or {}
+                self.state.key_lineage[key] = lineage
+                self._dirty.main = true
+            end
+        end
+    end
+    local unadopted = 0
+    for id in pairs(left) do if not chosen[id] then unadopted = unadopted + 1 end end
+    local hash = book_hash or (type(sources) == "table" and sources[1])
+    if type(hash) == "string" and hash ~= "" then
+        local previous = tonumber(self.state.unadopted[hash])
+        if unadopted > 0 or previous then
+            self.state.unadopted[hash] = unadopted
+            self._dirty.main = true
+        end
+    end
+    return count
+end
+
 --- Lo ya sincronizado de un libro vive en su propio archivo: anotar un
 -- subrayado reescribe ese libro y nada mas. `defer` lo deja para el proximo
 -- `flush`.
@@ -932,6 +1362,20 @@ function Queue:setAnnotationState(book_hash, value, defer)
     end
     self._books[book_hash] = value
     self._dirty.books[book_hash] = true
+    -- Un rechazo a reemitir deja de estar pendiente cuando la comparacion lo
+    -- volvio a anotar con huella (es decir, lo volvio a encolar). Bajo esta
+    -- clave, o bajo cualquier otra si el subrayado se mudo: un rechazo anotado
+    -- por hash (evento de una version anterior) se reenvia desde la clave.
+    for pending in pairs(self.state.reemit_pending) do
+        local key, sync_id = pending:match("^(.*)|([^|]+)$")
+        local entry = sync_id and value[sync_id]
+        if key == book_hash or entry ~= nil then
+            if type(entry) ~= "table" or entry.fingerprint ~= nil or entry.present == false then
+                self.state.reemit_pending[pending] = nil
+                self._dirty.main = true
+            end
+        end
+    end
     if not defer then self:flush() end
     return true
 end
@@ -946,7 +1390,7 @@ end
 function Queue:sendableCount(force)
     local now, count = self.now(), 0
     for _, event in ipairs(self.state.outbox) do
-        local held = event.event_type == "progress.changed" and self:isProgressHeld(event.book_identifier)
+        local held = event.event_type == "progress.changed" and self:isProgressHeld(event.book_identifier, event._book_key)
         if not held and (force or (tonumber(event._next_attempt_at) or 0) <= now) then
             count = count + 1
         end
@@ -1096,6 +1540,10 @@ local function wipeAccountState(self, scope_id)
     self.state.rejected = {}
     self.state.resume_decisions = {}
     self.state.progress_holds = {}
+    self.state.book_keys = {}
+    self.state.unadopted = {}
+    self.state.key_lineage = nil
+    self.state.reemit_pending = {}
     self.state.applied_cursor = "0"
     -- Pairing may reuse this installation's server device. Keep its sequence
     -- high-water mark across logout/account changes; gaps are harmless.

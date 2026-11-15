@@ -7,6 +7,7 @@ local ltn12 = require("ltn12")
 local logger = require("logger")
 local _ = require("i18n")
 local Background = require("backgroundsync")
+local SleepBudget = require("sleepbudget")
 
 local WebApi = {}
 
@@ -58,6 +59,9 @@ local function requestFor(url)
 end
 
 local function timeoutValues(quick)
+    -- `quick == "sleep"`: el intercambio de dormir tiene plazos propios, mas cortos.
+    local sleep_block, sleep_total = SleepBudget.timeouts(quick)
+    if sleep_block then return sleep_block, sleep_total end
     if quick then return QUICK_BLOCK_TIMEOUT, QUICK_TOTAL_TIMEOUT end
     return socketutil.LARGE_BLOCK_TIMEOUT, socketutil.LARGE_TOTAL_TIMEOUT
 end

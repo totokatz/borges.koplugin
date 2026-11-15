@@ -26,6 +26,7 @@
 
 local _ = require("i18n")
 local T = require("ffi/util").template
+local LocatorNorm = require("locatornorm")
 
 local ResumeFlow = {}
 ResumeFlow.__index = ResumeFlow
@@ -100,8 +101,48 @@ function ResumeFlow.readingTime(position)
     return base .. "." .. ((fraction or "") .. "000000000"):sub(1, 9)
 end
 
+-- F6: letras normalizadas que tienen que coincidir para decir "el mismo
+-- parrafo" (la misma regla que sameLocatorText en shared/positionLocator.js).
+ResumeFlow.SAME_TEXT_MIN = 48
+
+local function locatorTexts(locator)
+    local text = type(locator) == "table" and locator.text or nil
+    if type(text) ~= "table" then return nil end
+    local highlight = type(text.highlight) == "string" and text.highlight or ""
+    local after = type(text.after) == "string" and text.after or ""
+    local before = type(text.before) == "string" and text.before or ""
+    local forward = LocatorNorm.normalize(highlight .. after)
+    if forward == "" then return nil end
+    return forward, LocatorNorm.normalize(before .. " " .. highlight .. after)
+end
+
+local function firstCodepoints(s, n)
+    local i, count, len = 1, 0, #s
+    while i <= len and count < n do
+        local _cp, nexti = LocatorNorm.decode(s, i)
+        i = nexti
+        count = count + 1
+    end
+    return s:sub(1, i - 1), count
+end
+
+--- Dos localizadores hablan del mismo parrafo: los primeros 48 codepoints
+-- normalizados de lo que muestra uno estan tal cual en el texto del otro (dos
+-- pantallas del mismo parrafo con otra letra empiezan en lugares distintos).
+function ResumeFlow.sameText(left, right)
+    local forward_a, whole_a = locatorTexts(left)
+    local forward_b, whole_b = locatorTexts(right)
+    if not forward_a or not forward_b then return false end
+    local function contains(forward, whole)
+        local probe, count = firstCodepoints(forward, ResumeFlow.SAME_TEXT_MIN)
+        return count >= ResumeFlow.SAME_TEXT_MIN and whole:find(probe, 1, true) ~= nil
+    end
+    return contains(forward_a, whole_b) or contains(forward_b, whole_a)
+end
+
 function ResumeFlow.samePosition(left, right)
     if type(left) ~= "table" or type(right) ~= "table" then return false end
+    if ResumeFlow.sameText(left.locator, right.locator) then return true end
     local a, b = trim(left.xpointer), trim(right.xpointer)
     if a and b then return a == b end
     a, b = numberOrNil(left.percentage), numberOrNil(right.percentage)
@@ -480,8 +521,17 @@ function ResumeFlow.describe(context)
 
     -- Los dos avisos que cambian la decisión: que el salto va para atrás y que
     -- la ubicación es aproximada. Van juntos y antes de los botones.
+    -- F6: donde quedaste, con sus palabras.
+    local quote = ResumeFlow.quote(type(context.remote) == "table" and context.remote.locator or nil)
+    if quote then
+        table.insert(lines, T(_("Where you stopped: “%1…”"), quote))
+    end
+
     local warnings = {}
-    local remote_pct = comparablePercentage(context.remote, total)
+    -- Traducido a este libro por capitulo cuando se pudo (otra edicion, otra
+    -- letra): el porcentaje del otro aparato no es comparable entre ediciones.
+    local remote_pct = type(context.remote) == "table" and numberOrNil(context.remote.comparable_percentage)
+        or comparablePercentage(context.remote, total)
     local local_pct = comparablePercentage(context.local_position, total)
     local backwards = false
     if remote_pct ~= nil and local_pct ~= nil then
@@ -494,10 +544,9 @@ function ResumeFlow.describe(context)
         end
     end
 
+    local anchor = ResumeFlow.anchorOf(context.remote)
     local approximate = context.approximate
-    if approximate == nil then
-        approximate = not trim(type(context.remote) == "table" and context.remote.xpointer or nil)
-    end
+    if approximate == nil then approximate = anchor == "approximate" end
     if approximate then
         table.insert(warnings, _("The location is approximate: it may land a few lines earlier or later."))
     end
@@ -518,7 +567,42 @@ function ResumeFlow.describe(context)
         backwards = backwards,
         approximate = approximate == true,
         source_name = source_name,
+        quote = quote,
+        anchor = anchor,
     }
+end
+
+ResumeFlow.QUOTE_CHARS = 60
+
+--- El comienzo de lo que se veia en la otra pantalla, cortado en una palabra.
+function ResumeFlow.quote(locator)
+    local text = type(locator) == "table" and locator.text or nil
+    local highlight = type(text) == "table" and trim(text.highlight) or nil
+    if not highlight then return nil end
+    highlight = highlight:gsub("%s+", " ")
+    local cut, count = firstCodepoints(highlight, ResumeFlow.QUOTE_CHARS)
+    if #cut < #highlight then
+        -- Cortar en el ultimo espacio, si deja algo razonable.
+        local last = cut:match("^.*() ")
+        if last and last > 1 then cut = cut:sub(1, last - 1) end
+    end
+    cut = trim(cut)
+    if not cut or count == 0 then return nil end
+    return cut
+end
+
+--- Que tan firme es la ubicacion de una posicion (solo para el texto).
+-- La decide quien arma la posicion (`anchor`, con el documento a mano); sin
+-- eso: xpointer = exacta, texto = por su texto, capitulo = por capitulo.
+function ResumeFlow.anchorOf(remote)
+    if type(remote) ~= "table" then return "approximate" end
+    local given = remote.anchor
+    if given == "exact" or given == "text" or given == "chapter" or given == "approximate" then return given end
+    if trim(remote.xpointer) then return "exact" end
+    local locator = type(remote.locator) == "table" and remote.locator or nil
+    if locator and locatorTexts(locator) then return "text" end
+    if locator and trim(locator.title) then return "chapter" end
+    return "approximate"
 end
 
 --- El detalle técnico, sólo para quien lo abre a propósito. Acá sí van los
@@ -537,8 +621,13 @@ function ResumeFlow.describeDetail(context)
         positionLine(context.remote, total)))
 
     local remote = type(context.remote) == "table" and context.remote or {}
-    if trim(remote.xpointer) then
+    local anchor = ResumeFlow.anchorOf(context.remote)
+    if anchor == "exact" then
         table.insert(lines, _("Book anchor: exact"))
+    elseif anchor == "text" then
+        table.insert(lines, _("Book anchor: found by its text"))
+    elseif anchor == "chapter" then
+        table.insert(lines, _("Book anchor: by chapter"))
     else
         table.insert(lines, _("Book anchor: missing, estimated from the percentage"))
     end

@@ -244,6 +244,51 @@ function MenuTree.build(plugin, deps)
                 separator = true,
             },
             {
+                -- F1 · prendido por defecto.
+                text = _("Measure reading in words"),
+                help_text = _("Borges notes which part of the text each screen showed and for how long, to work out your real reading speed and time left. It saves counts and positions, never the text. Nothing is sent until the next sync."),
+                keep_menu_open = true,
+                checked_func = checked("avanzado.words", function() return plugin:isReadingSpansEnabled() end),
+                callback = action("avanzado.words", function() plugin:toggleReadingSpans() end),
+            },
+            {
+                -- F2 · las tres capturas, prendidas por defecto.
+                text = _("Record how each page was reached"),
+                help_text = _("Borges notes whether each screen came from turning the page, the table of contents, a search, a link or going back, to tell reading apart from jumping around. Never the text."),
+                keep_menu_open = true,
+                checked_func = checked("avanzado.cause", function() return plugin:isNavCauseEnabled() end),
+                callback = action("avanzado.cause", function() plugin:toggleNavCause() end),
+            },
+            {
+                text = _("Record reading pauses and how the reader went to sleep"),
+                help_text = _("Borges notes when you last touched the screen before the reader went to sleep, and whether it was the button, the cover or inactivity, so a forgotten reader does not count as reading time."),
+                keep_menu_open = true,
+                checked_func = checked("avanzado.pauses", function() return plugin:isAttentionEnabled() end),
+                callback = action("avanzado.pauses", function() plugin:toggleAttentionCapture() end),
+            },
+            {
+                text = _("Record reading conditions (light, battery, font)"),
+                help_text = _("When the book opens, closes, sleeps or wakes, Borges notes the battery level, charging, the light, night mode, the orientation, the font and whether Wi-Fi was on. Nothing is sent until the next sync."),
+                keep_menu_open = true,
+                checked_func = checked("avanzado.conditions", function() return plugin:isDeviceStateEnabled() end),
+                callback = action("avanzado.conditions", function() plugin:toggleDeviceStateCapture() end),
+            },
+            {
+                text = _("Show time left in the status bar"),
+                help_text = _("Adds Borges' estimate, based on how fast you actually read this book, to the status bar. Turn on \"External content\" in the status bar settings to see it."),
+                keep_menu_open = true,
+                checked_func = checked("avanzado.footer", function() return plugin:isFooterTimeLeftEnabled() end),
+                callback = action("avanzado.footer", function() plugin:toggleFooterTimeLeft() end),
+            },
+            {
+                -- F6: prendido por defecto.
+                text = _("Save the text where you stopped"),
+                help_text = _("Borges keeps the first words of the screen where you stopped, so another reader or the web can open the same paragraph even with another font or another file of the same book. It is overwritten every time and deleted with your account."),
+                checked_func = checked("avanzado.positiontext", function() return plugin:isPositionTextCaptureEnabled() end),
+                callback = action("avanzado.positiontext", function() plugin:togglePositionTextCapture() end),
+                separator = true,
+            },
+            {
                 text = _("Resend all reading statistics"),
                 keep_menu_open = true,
                 enabled_func = enabled("avanzado.stats", function() return plugin:hasAccountAccess() end),

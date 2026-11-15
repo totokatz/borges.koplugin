@@ -5,6 +5,34 @@ local function resolve(value)
     return type(value) == "function" and value() or value
 end
 
+--- `server_time` del servidor (ISO 8601 en UTC) a segundos epoch, sin pasar
+-- por `os.time`, que interpretaria la fecha en el huso del aparato.
+function SyncV2.parseServerTime(iso)
+    if type(iso) ~= "string" then return nil end
+    local y, mo, d, h, mi, s = iso:match("^(%d%d%d%d)%-(%d%d)%-(%d%d)T(%d%d):(%d%d):(%d%d)%.?%d*Z$")
+    if not y then return nil end
+    y, mo, d, h, mi, s = tonumber(y), tonumber(mo), tonumber(d), tonumber(h), tonumber(mi), tonumber(s)
+    if mo < 1 or mo > 12 or d < 1 or d > 31 or h > 23 or mi > 59 or s > 60 then return nil end
+    -- Dias desde 1970-01-01 (algoritmo de calendario civil de H. Hinnant).
+    local year = mo <= 2 and y - 1 or y
+    local era = math.floor(year / 400)
+    local yoe = year - era * 400
+    local mp = (mo + 9) % 12
+    local doy = math.floor((153 * mp + 2) / 5) + d - 1
+    local doe = yoe * 365 + math.floor(yoe / 4) - math.floor(yoe / 100) + doy
+    local days = era * 146097 + doe - 719468
+    return days * 86400 + h * 3600 + mi * 60 + s
+end
+
+--- Cuanto esta corrido el reloj de este lector respecto del servidor. Se
+-- anota diferido: sale con el guardado del mismo intercambio.
+function SyncV2:_noteServerTime(response)
+    local server = type(response) == "table" and SyncV2.parseServerTime(response.server_time)
+    if server and self.queue.setClockSkew then
+        self.queue:setClockSkew(server - os.time())
+    end
+end
+
 function SyncV2:new(options)
     options = options or {}
     assert(options.web_api, "web_api is required")
@@ -72,6 +100,14 @@ end
 function SyncV2:_pull(quick, focus_book, focus_only, context)
     -- `context` lo pasa quien consulta un libro que no es el abierto.
     local reading_context = focus_only and (context or resolve(self.reading_context)) or nil
+    -- F5 · El libro que se pregunta (titulo y archivo): con dos libros del
+    -- mismo hash, el servidor contesta la cabeza de ESE. Un servidor viejo la
+    -- ignora.
+    -- Quien pregunta por otro libro (uno cerrado) trae su propio contexto: la
+    -- pista del libro abierto no vale para ese.
+    local hint_context = focus_book and (context or resolve(self.reading_context)) or nil
+    local focus_hint = type(hint_context) == "table" and type(hint_context.hint) == "table"
+        and (hint_context.hint.title or hint_context.hint.file) and hint_context.hint or nil
     local response, err = self.web_api:postJSON(
         self:getBaseUrl() .. "/api/sync/v2/pull",
         self:getAuth(),
@@ -80,10 +116,12 @@ function SyncV2:_pull(quick, focus_book, focus_only, context)
             cursor = self.queue:getCursor(),
             limit = self.pull_limit,
             focus_book = focus_book,
+            focus_hint = focus_hint,
             focus_only = focus_only == true or nil,
             client = resolve(self.client) or {},
         },
-        quick == true
+        -- Tal cual: `"sleep"` pide los plazos del intercambio de dormir.
+        quick
     )
     if not response then
         self.queue:setLastError(err)
@@ -101,6 +139,7 @@ function SyncV2:_pull(quick, focus_book, focus_only, context)
         return nil, protocol_err
     end
 
+    self:_noteServerTime(response)
     -- Sin acuses no se descarta ni un evento del outbox: `commitExchange` sólo
     -- agrega al inbox y mueve el cursor.
     response.acknowledgements = {}
@@ -167,8 +206,19 @@ function SyncV2:enqueue(event, options)
     return self.queue:enqueueEvent(event, options)
 end
 
-function SyncV2:sync(force, quick)
-    local events = self.queue:prepareBatch(nil, nil, force)
+--- Un intercambio. `quick` viaja tal cual a la red (`"sleep"` pide los plazos de
+-- dormir). `options` acota el lote para quien tiene apuro:
+--   max_events, max_bytes  tope del lote (por defecto los de la cola)
+--   priority               `event_type` que se eligen primero
+--   max_recoveries         recuperaciones en total; sin el, la regla de siempre
+--   deadline               epoch: ningun pedido (ni reintento) empieza despues
+function SyncV2:sync(force, quick, options)
+    options = type(options) == "table" and options or {}
+    local batch_options = options.priority and { priority = options.priority } or nil
+    local function prepare(force_batch)
+        return self.queue:prepareBatch(options.max_events, options.max_bytes, force_batch, batch_options)
+    end
+    local events = prepare(force)
     local url, payload
     if #events > 0 then
         url = self:getBaseUrl() .. "/api/sync/v2/exchange"
@@ -188,12 +238,20 @@ function SyncV2:sync(force, quick)
         }
     end
 
-    local response, err = self.web_api:postJSON(url, self:getAuth(), payload, quick == true)
+    local response, err = self.web_api:postJSON(url, self:getAuth(), payload, quick)
     -- Recuperaciones acotadas: una de secuencias por lote (los aceptados del
     -- lote conservan id/secuencia y reciben un ACK duplicado) y una por cada
-    -- evento que el servidor nombre en un idempotency_conflict.
-    local sequences_recovered, reissued = false, 0
+    -- evento que el servidor nombre en un idempotency_conflict. Con
+    -- `max_recoveries`, ademas, un tope total: al dormir la pantalla espera.
+    local max_recoveries = tonumber(options.max_recoveries)
+    local sequences_recovered, reissued, recoveries = false, 0, 0
+    -- `options.deadline` (epoch): pasado ese momento no empieza ningun pedido
+    -- mas, tampoco un reintento. Al dormir la pantalla espera.
+    local deadline = tonumber(options.deadline)
+    local optional_dropped = false
     while not response and #events > 0 and type(err) == "table" do
+        if max_recoveries and recoveries >= max_recoveries then break end
+        if deadline and os.time() >= deadline then break end
         local recovered = false
         if err.code == "client_sequence_conflict" and not sequences_recovered then
             sequences_recovered = true
@@ -201,11 +259,28 @@ function SyncV2:sync(force, quick)
         elseif err.code == "idempotency_conflict" and reissued < #events then
             recovered = self.queue:reissueConflicting(err.details, events)
             if recovered then reissued = reissued + 1 end
+        elseif err.code == "validation_failed" and not optional_dropped then
+            -- Un servidor viejo que no conoce un evento de captura: se descarta
+            -- y el resto del lote sigue (Queue:dropUnsupportedOptional).
+            optional_dropped = true
+            recovered = self.queue:dropUnsupportedOptional(err.details, events)
         end
         if not recovered then break end
-        events = self.queue:prepareBatch(nil, nil, true)
-        payload.events = events
-        response, err = self.web_api:postJSON(url, self:getAuth(), payload, quick == true)
+        recoveries = recoveries + 1
+        events = prepare(true)
+        if #events == 0 then
+            -- No quedo nada por subir: lo que sigue es una consulta comun.
+            url = self:getBaseUrl() .. "/api/sync/v2/pull"
+            payload = {
+                protocol_version = 2,
+                cursor = self.queue:getCursor(),
+                limit = self.pull_limit,
+                client = resolve(self.client) or {},
+            }
+        else
+            payload.events = events
+        end
+        response, err = self.web_api:postJSON(url, self:getAuth(), payload, quick)
     end
     if not response then
         self.queue:setLastError(err)
@@ -223,6 +298,7 @@ function SyncV2:sync(force, quick)
         return nil, protocol_err
     end
 
+    self:_noteServerTime(response)
     if response.acknowledgements == nil then response.acknowledgements = {} end
     local committed, commit_err = self.queue:commitExchange(response, self.apply_event)
     if not committed then

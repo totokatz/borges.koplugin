@@ -8,6 +8,17 @@ release. Una versión sin sección se ofrece igual, sin novedades para mostrar.
 Escribí en criollo y en presente, una línea por cambio, pensando en alguien
 que está por tocar «Actualizar» en un lector de tinta electrónica.
 
+## 2026.11.15.1
+
+- Putting the reader to sleep is faster. It sends your position and reading time first, in one short step, and anything left over goes out later in the background instead of holding the screen.
+- Borges now measures your reading in words. Your reading diary on the web shows your real reading speed, how much time is left in each book and where you slowed down. Only counts and positions are sent, never the text of the book.
+- The status bar can show how much time is left in the book, based on how fast you actually read it. Turn on "External content" in the status bar settings to see it.
+- Reading time on the web no longer counts a reader left open on the table. Borges notes how each page was reached, when you last touched the screen and how the reader went to sleep.
+- Your other readers and the web can open the same paragraph where you stopped, even with another font or another file of the same book. Borges keeps the first words of that screen for this, and overwrites them every time you move.
+- Two books that KOReader identifies with the same code no longer mix their highlights or their positions.
+- Renaming a book file no longer sends all of its old highlights again.
+- Each new capture has its own switch in Advanced, on by default.
+
 ## 2026.11.14.1
 
 - Turning Wi-Fi off by hand while reading no longer leaves the reader unresponsive. A status message meant for the sleep screen was being drawn over the book, and it swallowed every touch until the reader was put to sleep and woken up again.

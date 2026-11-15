@@ -110,11 +110,20 @@ local function bookPayload(book)
         or book.title == "" then
         return nil
     end
+    -- F5 · Los identificadores del libro (ISBN, UUID), tal cual los da
+    -- KOReader. Viajan con el libro y no entran en la huella (`book` esta en
+    -- FINGERPRINT_EXCLUDED).
+    local identifiers = stringValue(book.identifiers)
+    if identifiers then
+        identifiers = identifiers:gsub("^%s+", ""):gsub("%s+$", ""):sub(1, 512)
+        if identifiers == "" then identifiers = nil end
+    end
     return {
         title = book.title,
         author = stringValue(book.author),
         file = stringValue(book.file),
         total_pages = tonumber(book.total_pages),
+        identifiers = identifiers,
     }
 end
 
@@ -136,11 +145,23 @@ local RENDER_FIELDS = { book = true, base_revision = true, page = true, total_pa
 -- La formula anterior, solo para reconocer lo ya sincronizado con ella.
 local LEGACY_FIELDS = { book = true, base_revision = true }
 
-local function fingerprintOf(payload, excluded)
+-- F5 · Huella v3: tampoco entra `time`. Es la fecha del subrayado pasada a
+-- epoch con `os.time`, que la interpreta en el huso del aparato: cambiar de
+-- huso (o el horario de verano) cambiaba `time` y re-emitia el libro entero.
+-- En su lugar entra `datetime`, el texto que guarda KOReader, igual en
+-- cualquier huso. El payload que viaja no cambia: `time` sigue.
+-- Publica: lo que otros planes agreguen al payload y dependa del aparato o del
+-- render va aca, o cada lector re-emite el libro.
+AnnotationAdapter.FINGERPRINT_EXCLUDED = {
+    book = true, base_revision = true, page = true, total_pages = true, time = true,
+}
+
+local function fingerprintOf(payload, excluded, extra)
     local fingerprint_payload = {}
     for key, value in pairs(payload) do
         if not excluded[key] then fingerprint_payload[key] = value end
     end
+    for key, value in pairs(extra or {}) do fingerprint_payload[key] = value end
     return md5(stableEncode(fingerprint_payload))
 end
 
@@ -175,7 +196,10 @@ function AnnotationAdapter:normalize(book_hash, item, book)
         sync_id = sync_id,
         kind = kind,
         payload = payload,
-        fingerprint = fingerprintOf(payload, RENDER_FIELDS),
+        fingerprint = fingerprintOf(payload, AnnotationAdapter.FINGERPRINT_EXCLUDED,
+            { datetime = stringValue(item.datetime) }),
+        -- Las formulas anteriores, solo para reconocer lo ya sincronizado.
+        fingerprint_v2 = fingerprintOf(payload, RENDER_FIELDS),
     }
 end
 
@@ -190,11 +214,59 @@ local function twinSyncId(book_hash, kind, item)
         .. "|" .. tostring(item.datetime or ""))
 end
 
-function AnnotationAdapter:diff(book_hash, annotations, previous, book)
+--- El id que la formula derivada le da a una anotacion (hash del libro, tipo
+-- y ubicacion). Es el que tienen las anotaciones ya sincronizadas por
+-- versiones anteriores; lo usa `BookKey.migrate` para reconocerlas.
+function AnnotationAdapter.deriveSyncId(book_hash, item)
+    assert(type(book_hash) == "string" and book_hash ~= "", "book_hash is required")
+    local kind = item.drawer == nil and "bookmark" or "highlight"
+    return uuidFromSeed(book_hash:lower() .. "|" .. kind .. "|" .. locatorKey(item))
+end
+
+--- `options.new_id()`: el id de una anotacion NUEVA (sin `toto_sync_id`). Sin
+-- el, el comportamiento de antes: el id derivado. Con el, el derivado solo se
+-- usa si ya esta en `previous` (una anotacion ya sincronizada que todavia no
+-- tenia el id escrito en el sidecar); si no, uno aleatorio. El derivado se
+-- repite entre dos libros del mismo hash con un subrayado en el mismo lugar, y
+-- el servidor no puede distinguirlos. Un `toto_sync_id` valido no cambia nunca.
+function AnnotationAdapter:diff(book_hash, annotations, previous, book, options)
     annotations = type(annotations) == "table" and annotations or {}
     previous = type(previous) == "table" and previous or {}
+    options = type(options) == "table" and options or {}
     local events, next_state = {}, {}
     local assigned = 0
+    -- Ids que el servidor dijo que ya usa otro subrayado (de otro libro): el
+    -- subrayado recibe uno nuevo y el viejo se retira SIN emitir un borrado,
+    -- que caeria sobre el subrayado del otro libro.
+    local retired = {}
+    local reidentify = type(options.reidentify) == "table" and options.reidentify or {}
+    if options.new_id then
+        for _, item in ipairs(annotations) do
+            if type(item) == "table" and validUuid(item.toto_sync_id)
+                and reidentify[item.toto_sync_id:lower()] then
+                local fresh = options.new_id()
+                if validUuid(fresh) then
+                    retired[item.toto_sync_id:lower()] = true
+                    item.toto_sync_id = fresh:lower()
+                    item.toto_revision = nil
+                    assigned = assigned + 1
+                end
+            end
+        end
+        for _, item in ipairs(annotations) do
+            if type(item) == "table" and not validUuid(item.toto_sync_id) then
+                local derived = AnnotationAdapter.deriveSyncId(book_hash, item)
+                if previous[derived] == nil then
+                    local fresh = options.new_id()
+                    if validUuid(fresh) then
+                        item.toto_sync_id = fresh:lower()
+                        -- Escrito en el sidecar con la proxima escritura.
+                        assigned = assigned + 1
+                    end
+                end
+            end
+        end
+    end
 
     -- Lo que la pasada ya vio, por id: sirve para reconocer el mismo pasaje
     -- anotado dos veces en el sidecar.
@@ -229,11 +301,21 @@ function AnnotationAdapter:diff(book_hash, annotations, previous, book)
                 revision = old_revision,
                 present = true,
             }
+            -- El rastro de un rechazo sigue con la entrada mientras el
+            -- subrayado no cambie: asi el tope de reenvios se cuenta entre
+            -- comparaciones. Si la persona lo edito, es contenido nuevo.
+            if type(old) == "table" and (old.reemit or old.rejected)
+                and (old.fingerprint == nil or old.fingerprint == normalized.fingerprint) then
+                local entry = next_state[normalized.sync_id]
+                entry.reemit, entry.rejected = old.reemit, old.rejected
+                entry.rejected_event, entry.rejected_action = old.rejected_event, old.rejected_action
+            end
             -- Lo sincronizado con la formula anterior (que incluia la pagina)
             -- se reconoce y pasa a la nueva sin mandar nada.
             local changed = old_fingerprint ~= normalized.fingerprint
                 and (old_fingerprint == nil
-                    or old_fingerprint ~= fingerprintOf(normalized.payload, LEGACY_FIELDS))
+                    or (old_fingerprint ~= normalized.fingerprint_v2
+                        and old_fingerprint ~= fingerprintOf(normalized.payload, LEGACY_FIELDS)))
             if changed then
                 local event_type
                 if normalized.kind == "bookmark" then
@@ -254,7 +336,13 @@ function AnnotationAdapter:diff(book_hash, annotations, previous, book)
     end
 
     for sync_id, old in pairs(previous) do
-        if next_state[sync_id] == nil and validUuid(sync_id)
+        if retired[sync_id] and next_state[sync_id] == nil then
+            next_state[sync_id] = {
+                kind = type(old) == "table" and old.kind or "highlight",
+                revision = type(old) == "table" and revisionValue(old.revision) or "0",
+                present = false,
+            }
+        elseif next_state[sync_id] == nil and validUuid(sync_id)
             and (type(old) ~= "table" or old.present ~= false) then
             local old_kind = type(old) == "table" and old.kind or "highlight"
             local old_revision = type(old) == "table"

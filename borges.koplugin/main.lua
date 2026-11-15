@@ -38,7 +38,12 @@ local SettingsMigration = require("settingsmigration")
 local Pairing = require("pairing")
 local Login = require("login")
 local SyncV2 = require("syncv2")
+local PositionLocator = require("positionlocator")
+local TextLocate = require("textlocate")
 local Background = require("backgroundsync")
+local SleepBudget = require("sleepbudget")
+local BookKey = require("bookkey")
+local random = require("random")
 local ProgressMessage = require("progressmessage")
 local ReadingWifi = require("readingwifi")
 local UpdateCheck = require("updatecheck")
@@ -48,6 +53,15 @@ local MenuTree = require("menutree")
 local ReadingPosition = require("readingposition")
 local ResumeFlow = require("resumeflow")
 local AnnotationAdapter = require("annotationadapter")
+local DocText = require("doctext")
+local ReadingLog = require("readinglog")
+local NavCause = require("navcause")
+local Attention = require("attention")
+local DeviceState = require("devicestate")
+local ui_time_ok, UITime = pcall(require, "ui/time")
+if not ui_time_ok or type(UITime) ~= "table" then UITime = nil end
+local datetime_ok, datetime = pcall(require, "datetime")
+if not datetime_ok or type(datetime) ~= "table" then datetime = nil end
 local Device = require("device")
 local util = require("util")
 local Screen = Device.screen
@@ -132,6 +146,8 @@ local RECONNECT_SYNC_DEBOUNCE = 25
 -- por libro mientras haya red; al dormir o al cortarse el Wi-Fi, siempre.
 local HELD_CHECK_INTERVAL = 60
 local HELD_CHECK_MAX_BOOKS = 5
+-- Entradas por pedido de la foto historica (ver `_bridgeHistoryInBackground`).
+local BRIDGE_CHUNK_ENTRIES = 100
 -- Segundos entre la consulta al servidor y la subida de lo pendiente. No es
 -- una espera decorativa: le da lugar al aviso de posición para llegar a la
 -- pantalla antes de que la cola vieja empiece a viajar.
@@ -205,7 +221,12 @@ local Shared = { queue = nil, queue_dir = nil, live = nil,
     -- manejadores de red no tienen que tomar por una reconexion de la persona.
     wifi_owned = false, wifi_auto_closed = false, wifi_edge = false, wifi_closing = false,
     -- La conexion silenciosa en curso y si la ultima no llego a conectar.
-    wifi_quiet = nil, wifi_quiet_failed = false }
+    wifi_quiet = nil, wifi_quiet_failed = false,
+    -- Cuando salio el ultimo intercambio de dormir: el explorador y el libro
+    -- reciben el mismo Suspend y el mismo NetworkDisconnecting, y tiene que
+    -- salir uno solo (ver `_drainQueueBlocking`). Y si ya salio en esta
+    -- suspension: se borra al despertar.
+    sleep_exchange_at = nil, sleep_exchange_this_suspension = false }
 
 --- Correr algo que prende el Wi-Fi sin los carteles de KOReader.
 --
@@ -330,6 +351,22 @@ function HighlightsDeToto:init()
     -- larger payloads, so they are intentionally kept out of page-turn timers.
     self.periodic_push_task = function()
         self:_runBackgroundSync("progress", function() self:pushProgress(false) end)
+    end
+
+    -- Lo que hace falta despues de mover la pantalla (leer el XPointer, contar
+    -- la pagina, re-armar el envio) corre aca, fuera del aviso de KOReader.
+    self._screen_move_task = function()
+        local move = self._screen_move
+        self._screen_move = nil
+        if not move or self._closed then return end
+        self:_safecall("screenMoved", function()
+            local page = move.page
+            if page == nil and self.ui and self.ui.getCurrentPage then page = self.ui:getCurrentPage() end
+            self:_handlePageChange(page)
+        end)
+        -- F1 · la pantalla nueva queda registrada y se cuenta aca, despues del
+        -- pintado, con el XPointer que _handlePageChange acaba de leer.
+        self:_safecall("readingScreen", function() self:_recordReadingScreen(move) end)
     end
 
     self.highlight_push_task = function()
@@ -481,9 +518,16 @@ function HighlightsDeToto:_initializePairingAndSync()
             return self:_applySyncV2Event(event)
         end,
         reading_context = function()
-            return { book_hash = self.book_hash, token = self.device_token, epoch = self._background_epoch }
+            return { book_hash = self.book_hash, token = self.device_token, epoch = self._background_epoch,
+                book_key = self.book_key,
+                hint = self.book_hash and { title = self.book_title, file = self.book_filename } or nil }
         end,
         on_reading_head = function(response, context)
+            -- F1 · la consulta enfocada trae el ritmo de este libro (reading_pace).
+            if self._applyReadingPace and (not context or context.book_hash == self.book_hash) then
+                local ok_pace, pace_err = pcall(self._applyReadingPace, self, response)
+                if not ok_pace then logger.warn("Borges: readingPace error:", pace_err) end
+            end
             return self:_handleReadingHead(response, context)
         end,
     }
@@ -576,14 +620,29 @@ function HighlightsDeToto:_recordOwnAnnotationRevision(event)
         return
     end
     local revision = tostring(metadata.annotation_revision)
-    local state = self.queue:getAnnotationState(identifier.value)
+    -- Lo sincronizado vive bajo la clave del libro del evento; un evento en
+    -- vuelo de una version anterior todavia esta anotado por hash.
+    local book = type(payload.book) == "table" and payload.book or {}
+    local state_key = BookKey.fromParts(identifier.value, book.file, book.title)
+    local state = state_key and self.queue:getAnnotationState(state_key) or {}
+    if state[sync_id] == nil then
+        local by_hash = self.queue:getAnnotationState(identifier.value)
+        if by_hash[sync_id] ~= nil then state_key, state = identifier.value, by_hash end
+    end
     local item_state = state[sync_id]
-    if type(item_state) == "table" and item_state.revision ~= revision then
+    -- Aceptado: el rastro de un rechazo anterior ya no aplica.
+    local had_rejection = type(item_state) == "table"
+        and (item_state.reemit ~= nil or item_state.rejected ~= nil)
+    if had_rejection then
+        item_state.reemit, item_state.rejected = nil, nil
+        item_state.rejected_event, item_state.rejected_action = nil, nil
+    end
+    if type(item_state) == "table" and (item_state.revision ~= revision or had_rejection) then
         item_state.revision = revision
         -- Diferido: el intercambio que trajo este acuse guarda una sola vez al
         -- terminar. Antes eran un guardado de la cola y uno del sidecar por
         -- cada subrayado confirmado.
-        self.queue:setAnnotationState(identifier.value, state, true)
+        self.queue:setAnnotationState(state_key, state, true)
     end
     if identifier.value ~= self.book_hash then return end
     local annotation_module = self.ui and self.ui.annotation
@@ -1295,6 +1354,8 @@ function HighlightsDeToto:_cancelBackgroundSync()
     if self._reading_wifi then self._reading_wifi:close(); self._reading_wifi = nil end
     self._background_pending = {}
     if self._background_sync then self._background_sync:cancel() end
+    -- F6: una busqueda de texto en curso tampoco sobrevive (libro, cuenta, sueño).
+    if self._locate_job then self._locate_job:cancel() end
     self:_closeSyncProgress()
     self._connect_sync_running = false
     self._plugin_update_check_running = false
@@ -1310,6 +1371,9 @@ end
 -- que quedo pendiente lo toma la instancia nueva, con la misma cola.
 function HighlightsDeToto:onCloseWidget()
     self._closed = true
+    -- F2 · una instancia cerrada no anota tramos ni causas.
+    if self._nav then self._nav:close() end
+    self._nav, self._attention = nil, nil
     if Shared.live == self then Shared.live = nil end
     self:_cancelBackgroundSync()
     if self.pairing then self.pairing:stopWatching() end
@@ -1338,6 +1402,45 @@ function HighlightsDeToto:_bookIdentifier(book_hash)
     }
 end
 
+--- Mudar a la clave del libro abierto lo que el plugin guardo por hash (o
+-- bajo la clave de antes de un renombre). Solo lo que el sidecar de ESTE
+-- libro prueba que es suyo; ver `BookKey.migrate`.
+function HighlightsDeToto:_adoptBookKeyState()
+    if not self.book_key or not self.book_hash or not self.queue then return 0 end
+    local annotation_module = self.ui and self.ui.annotation
+    local annotations = annotation_module and type(annotation_module.annotations) == "table"
+        and annotation_module.annotations or {}
+    local book_hash = self.book_hash
+    local adopted = BookKey.migrate(self.queue, self.book_key, book_hash, annotations, function(item)
+        return AnnotationAdapter.deriveSyncId(book_hash, item)
+    end)
+    -- La marca de foto historica se muda como el resto del estado: desde el
+    -- hash (versiones anteriores) o desde la clave de un nombre o titulo
+    -- anterior de este mismo libro (renombrar no repite la importacion).
+    -- Aunque no se haya adoptado nada (otro libro del mismo hash, o uno sin
+    -- nada sincronizado), lo de este libro igual viaja entero como eventos v2:
+    -- otra foto solo repetiria pedidos.
+    if self.annotation_v2_bridged[self.book_key] ~= true then
+        for _, source in ipairs(self.queue:annotationKeysForHash(book_hash)) do
+            if source ~= self.book_key and self.annotation_v2_bridged[source] == true then
+                self.annotation_v2_bridged[self.book_key] = true
+                self._sync_state_dirty = true
+                break
+            end
+        end
+    end
+    if adopted > 0 then
+        logger.info("Borges: adopted", adopted, "synchronized annotations under the book key")
+    end
+    return adopted
+end
+
+--- Donde vive lo ya sincronizado del libro abierto: su clave local
+-- (bookkey.lua), o el hash si todavia no se calculo.
+function HighlightsDeToto:_annotationStateKey()
+    return self.book_key or self.book_hash
+end
+
 function HighlightsDeToto:_annotationBookDescriptor()
     return {
         title = self.book_title ~= "" and self.book_title
@@ -1346,6 +1449,7 @@ function HighlightsDeToto:_annotationBookDescriptor()
         author = self.book_author,
         file = self.book_filename,
         total_pages = self.total_pages,
+        identifiers = self.book_identifiers,
     }
 end
 
@@ -1416,7 +1520,8 @@ function HighlightsDeToto:_applyAnnotationV2Event(event)
         self:_markSidecarDirty()
     end
 
-    local state = self.queue:getAnnotationState(self.book_hash)
+    local state_key = self:_annotationStateKey()
+    local state = self.queue:getAnnotationState(state_key)
     if result.action == "deleted" or result.action == "noop" then
         state[result.sync_id] = {
             kind = result.kind,
@@ -1431,7 +1536,7 @@ function HighlightsDeToto:_applyAnnotationV2Event(event)
             present = true,
         }
     end
-    self.queue:setAnnotationState(self.book_hash, state, true)
+    self.queue:setAnnotationState(state_key, state, true)
     self.last_web_sync = os.time()
     self._sync_state_dirty = true
     return true
@@ -1446,12 +1551,21 @@ function HighlightsDeToto:_enqueueAnnotationDiff()
         return 0, 0
     end
 
-    local previous = self.queue:getAnnotationState(self.book_hash)
+    local state_key = self:_annotationStateKey()
+    local previous = self.queue:getAnnotationState(state_key)
+    -- Los que el servidor rechazo porque su id ya es de otro subrayado.
+    local reidentify = {}
+    for sync_id, entry in pairs(previous) do
+        if type(entry) == "table" and entry.reidentify == true then reidentify[sync_id] = true end
+    end
     local events, next_state, assigned = AnnotationAdapter:diff(
         self.book_hash,
         annotation_module.annotations,
         previous,
-        self:_annotationBookDescriptor()
+        self:_annotationBookDescriptor(),
+        -- Un subrayado nuevo recibe un id aleatorio: el derivado de la
+        -- ubicacion se repite entre dos libros del mismo hash.
+        { new_id = function() return random.uuid(true):lower() end, reidentify = reidentify }
     )
     -- Primero el libro, despues la cola: un subrayado cuyo evento ya salio
     -- tiene que estar en el sidecar, o la proxima comparacion lo daria por
@@ -1474,9 +1588,10 @@ function HighlightsDeToto:_enqueueAnnotationDiff()
         event.book_identifier = self:_bookIdentifier(self.book_hash)
         event.occurred_at = os.date("!%Y-%m-%dT%H:%M:%SZ")
         event.time_precision = "exact"
+        event._book_key = self.book_key
         self.sync_v2:enqueue(event, { defer = true })
     end
-    self.queue:setAnnotationState(self.book_hash, next_state, true)
+    self.queue:setAnnotationState(state_key, next_state, true)
     -- Todos los subrayados nuevos y su anotacion de "ya encolado" salen en un
     -- guardado: primero el outbox, despues el libro. Antes era un guardado de
     -- toda la cola por cada subrayado.
@@ -1521,11 +1636,60 @@ function HighlightsDeToto:_progressPayload(is_jump)
         explicit_jump = is_jump == true,
         title = self.book_title,
         author = self.book_author,
+        -- F5 · Con el archivo el servidor distingue dos libros del mismo hash.
+        file = self.book_filename,
     }
+end
+
+--- F6: el localizador de la posicion que se va a encolar (capitulo, fraccion
+-- y, si el ajuste esta prendido, el texto de la pantalla). Se arma solo al
+-- encolar, nunca al pasar pagina; con el mismo XPointer se reusa el anterior
+-- (dormir despues de un autoguardado no vuelve a leer texto).
+-- Devuelve una copia: la cola nunca comparte tablas con la cache.
+function HighlightsDeToto:_progressLocator(payload)
+    if type(payload) ~= "table" or not self.ui or not self.ui.document then return nil end
+    local capture_text = self:isPositionTextCaptureEnabled()
+    local key = tostring(payload.xpointer or ("page:" .. tostring(payload.current_page)))
+    local cache = self._locator_cache
+    local locator
+    if cache and cache.key == key and cache.capture_text == capture_text then
+        locator = cache.locator
+    else
+        local ok, result = pcall(PositionLocator.capture, self.ui, {
+            has_pages = self.has_pages == true,
+            percentage = payload.percentage,
+            page = payload.current_page,
+            total_pages = payload.total_pages,
+            capture_text = capture_text,
+            xpointer = payload.xpointer,
+        })
+        if ok then
+            locator = result
+        else
+            locator = nil
+            if not self._locator_error_logged then
+                self._locator_error_logged = true
+                logger.warn("Borges: position locator failed:", tostring(result))
+            end
+        end
+        self._locator_cache = { key = key, capture_text = capture_text, locator = locator }
+    end
+    if type(locator) ~= "table" then return nil end
+    local copy = PositionLocator.copy(locator)
+    -- La fraccion del libro y la pagina se recalculan aunque el XPointer sea
+    -- el mismo (otra letra mueve la pagina sin mover el parrafo).
+    local pct = tonumber(payload.percentage)
+    if pct then copy.locations.totalProgression = math.floor(math.max(0, math.min(1, pct / 100)) * 10000 + 0.5) / 10000 end
+    if tonumber(payload.current_page) then copy.locations.position = math.floor(payload.current_page) end
+    return copy
 end
 
 --- @param defer boolean lo guarda el proximo queue:flush() de quien llama
 function HighlightsDeToto:_enqueueProgressV2(is_jump, defer)
+    -- Con que metodo se llego (sólo el encolado de ESE salto): se consume
+    -- siempre, salga o no el evento, para que no se pegue al próximo salto.
+    local arrived_by = self._pending_arrived_by
+    self._pending_arrived_by = nil
     if not self.book_hash then return nil end
     if is_jump then self:_recordReadingActivity() end
     -- Opening/reconnecting/closing an untouched book is not a new reading.
@@ -1535,6 +1699,13 @@ function HighlightsDeToto:_enqueueProgressV2(is_jump, defer)
     local signature = table.concat({book_hash, self._reading_activity_at,
         tostring(payload.xpointer or payload.current_page), tostring(is_jump == true)}, "|")
     if signature == self._last_enqueued_progress then return nil end
+    -- F6: el localizador se arma solo si el evento va a salir; no entra en la firma.
+    local ok_locator, locator = pcall(self._progressLocator, self, payload)
+    payload.locator = ok_locator and locator or nil
+    if is_jump and arrived_by then
+        payload.locator = payload.locator or { v = PositionLocator.VERSION, locations = {} }
+        payload.locator.arrived_by = arrived_by
+    end
     local result, err = self.sync_v2:enqueue({
         event_type = "progress.changed",
         aggregate_type = "reading_progress",
@@ -1543,6 +1714,8 @@ function HighlightsDeToto:_enqueueProgressV2(is_jump, defer)
         occurred_at = self._reading_activity_at,
         time_precision = "exact",
         payload = payload,
+        -- Local: la retencion y la coalescencia son por libro, no por hash.
+        _book_key = self.book_key,
     }, {
         -- Only never-attempted progress may be replaced. Once transport has
         -- seen an event its content remains immutable across every retry.
@@ -1661,43 +1834,83 @@ function HighlightsDeToto:_drainQueue(after_pull)
     end
 end
 
---- Synchronous full drain of the offline queue.
--- Used in onReaderReady/onResume to ensure the server has our offline progress
--- BEFORE we pullProgress. Without this, pull would auto-jump to a stale server
--- position (Bug #1 — progress regression after offline reading).
--- Also used in onNetworkDisconnecting as last-chance flush before WiFi turns off.
--- Bounded by Queue:drain's per-item LARGE timeout — typically returns in <10s
--- when items succeed, faster when offline (skips immediately).
+--- ¿Esta instancia (sin libro: el explorador) le deja lo de dormir al libro
+-- abierto en la instancia viva? Ese libro todavia tiene que encolar su
+-- posicion y su sesion, y es el unico que puede mandarlas.
+function HighlightsDeToto:_leavesSleepToOpenBook()
+    local live = Shared.live
+    return not self.book_hash and live ~= nil and live ~= self
+        and not live._closed and live.book_hash ~= nil
+end
+
+--- El intercambio de antes de dormir (o de cortarse el Wi-Fi), con la
+-- pantalla esperando. Acotado por `SleepBudget`: a lo sumo una consulta de la
+-- ultima lectura y UN intercambio (mas un reintento solo ante un 409 de
+-- secuencia o idempotencia), 40 eventos y 96 KB con la posicion y la sesion
+-- primero, plazos de 4 s / 8 s por pedido y nada empieza pasados 8 s.
+--
+-- Antes era una consulta por cada libro retenido mas hasta 50 paginas de
+-- intercambio y la cola legada entera: un libro de 125 subrayados nuevos eran
+-- siete intercambios al dormir. Lo que no entra no se pierde: queda en el
+-- outbox y sale con el proximo drenaje en segundo plano (lotes de 100). La
+-- cola legada tambien queda para `_drainQueue`, que la manda de a un item.
+--
+-- Devuelve nil sin red, false si la red fallo y true en cualquier otro caso.
 function HighlightsDeToto:_drainQueueBlocking(quick)
     if not NetworkMgr:isConnected() then return end
-    -- Es la ultima oportunidad con red (dormir, cortarse el Wi-Fi): una
-    -- posicion retenida pregunta siempre, sin esperar el intervalo.
-    self:_safecall("resolveHeldProgress", function() self:_resolveHeldProgress(true) end)
-    -- Sin nada que pueda salir no se hace ningun pedido: antes un outbox vacio
-    -- (o con la posicion retenida) costaba igual una consulta al servidor.
-    if self.device_token and self.queue:sendableCount() > 0 then
-        local sync_result, sync_err = self:_syncV2Now(quick == true, 50)
+    -- El explorador no drena si hay un libro abierto en la instancia viva: ese
+    -- libro todavia tiene que encolar su posicion y su sesion, y el
+    -- intercambio de la suspension tiene que llevarlas. Si el explorador
+    -- drenara primero, la guarda de abajo dejaria afuera lo del libro.
+    if self:_leavesSleepToOpenBook() then return true end
+    local started = os.time()
+    -- El explorador y el libro reciben el mismo aviso: la segunda instancia
+    -- no repite lo que la primera acaba de hacer. Y una suspension es UN
+    -- intercambio: el Wi-Fi que KOReader mata al dormir vuelve a avisar
+    -- NetworkDisconnecting quince segundos despues, con la pantalla negra.
+    local last = Shared.sleep_exchange_at
+    local asleep = Device.screen_saver_mode == true
+    if (last and started >= last and started - last < SleepBudget.REPEAT_GUARD_SECONDS)
+        or (asleep and Shared.sleep_exchange_this_suspension) then
+        return true
+    end
+    Shared.sleep_exchange_at = started
+    if asleep then Shared.sleep_exchange_this_suspension = true end
+    -- Es la ultima oportunidad con red: una posicion retenida pregunta
+    -- siempre, sin esperar el intervalo, pero por UN libro (el abierto primero).
+    local held_failed = false
+    self:_safecall("resolveHeldProgress", function()
+        local _, failed = self:_resolveHeldProgress(true, SleepBudget.FOCUS_CHECKS, "sleep")
+        held_failed = failed == true
+    end)
+    if held_failed then
+        -- La red acaba de fallar con la pantalla esperando: otro pedido iba a
+        -- tardar lo mismo en fallar. Todo queda guardado para la proxima vez.
+        Shared.sleep_exchange_at = os.time()
+        return false
+    end
+    -- Sin nada que pueda salir no se hace ningun pedido.
+    if self.device_token and self.queue:sendableCount() > 0
+        and os.time() - started < SleepBudget.DEADLINE_SECONDS then
+        local sync_result, sync_err = self.sync_v2:sync(false, "sleep", {
+            max_events = SleepBudget.MAX_EVENTS,
+            max_bytes = SleepBudget.MAX_BYTES,
+            priority = SleepBudget.PRIORITY,
+            max_recoveries = 1,
+            -- El tope de 8 s vale para CADA pedido, tambien para el reintento.
+            deadline = started + SleepBudget.DEADLINE_SECONDS,
+        })
+        Shared.sleep_exchange_at = os.time()
         if not sync_result then
-            logger.warn("Borges: blocking v2 drain failed:", tostring(sync_err))
-            -- La red acaba de fallar con la pantalla esperando: lo pendiente
-            -- queda guardado y no se insiste con otro pedido que va a tardar
-            -- lo mismo en fallar.
+            logger.warn("Borges: sleep exchange failed:", tostring(sync_err))
             return false
         end
         self.push_timestamp = os.time()
+        self.last_progress_sync = self.push_timestamp
+        self:saveSyncState(true)
     end
-    if self.queue:count() == self.queue:v2Count() then return true end
-    local r = self.queue:drain(self:getApi(), self:getBaseUrl(), self:getWebAuth())
-    if r and r.sent and r.sent > 0 then
-        -- Update sync timestamps for sent items (we don't know per-type from drain,
-        -- so be conservative and refresh both — drain only succeeds if server accepted).
-        local now = os.time()
-        self.last_web_sync = now
-        self.last_stats_sync = now
-        self.last_stats_error = nil
-        self:saveSyncState()
-        logger.info("Borges: legacy queue drain sent", r.sent, "items, failed", r.failed)
-    end
+    Shared.sleep_exchange_at = os.time()
+    return true
 end
 
 -- ============================================================
@@ -1736,7 +1949,7 @@ end
 function HighlightsDeToto:_beginReadingHandoff()
     if not self.device_token or not self.book_hash or not self.queue then return end
     self:_clearReadingHead()
-    self.queue:holdProgress(self:_bookIdentifier(self.book_hash))
+    self.queue:holdProgress(self:_bookIdentifier(self.book_hash), self.book_key)
 end
 
 --- Lo que dice la cabeza de lectura del servidor para `book_hash`: si hay que
@@ -1771,7 +1984,7 @@ function HighlightsDeToto:_handleReadingHead(response, context)
         local found, reason = self:_readReadingHead(response, context.book_hash)
         if not found then return nil, reason end
         if not found.ask then
-            self.queue:releaseProgress(self:_bookIdentifier(context.book_hash))
+            self.queue:releaseProgress(self:_bookIdentifier(context.book_hash), context.book_key)
         end
         logger.info("Borges: last reading checked for a closed book; still held:", found.ask)
         return true
@@ -1784,7 +1997,7 @@ function HighlightsDeToto:_handleReadingHead(response, context)
         ask = found.ask, event_id = found.event_id }
     self._reading_head = head
     logger.info("Borges: last reading checked; choice required:", head.ask)
-    if not head.ask then self.queue:releaseProgress(self:_bookIdentifier(self.book_hash)) end
+    if not head.ask then self.queue:releaseProgress(self:_bookIdentifier(self.book_hash), self.book_key) end
     return true
 end
 
@@ -1797,7 +2010,7 @@ function HighlightsDeToto:_finishReadingChoice(book_hash, remote, opts, action)
     self.ui.doc_settings:flush()
     self.resume_flow:remember(book_hash, remote, action,
         self.paired_device_id or self.device_id, self._reading_activity_at)
-    self.queue:releaseProgress(self:_bookIdentifier(book_hash))
+    self.queue:releaseProgress(self:_bookIdentifier(book_hash), book_hash == self.book_hash and self.book_key or nil)
     if self._reading_head then self._reading_head.ask = false end
     self:_resolveSuggestion(opts, action)
     UIManager:nextTick(function() self:_drainQueue() end)
@@ -1898,6 +2111,11 @@ function HighlightsDeToto:_runConnectedSync(reason, options)
                     self:_runBackgroundSync("drain", function()
                         self:_safecall("statsBeforeDrain", function() self:syncPageStatsDelta(true) end)
                         self:_safecall("queueDrain", function() self:_drainQueue(true) end)
+                        -- La foto historica del libro abierto, si todavia no
+                        -- salio: aca, en segundo plano y por partes.
+                        if self.book_hash and self.annotation_v2_bridged[self:_bridgeKey()] ~= true then
+                            self:_safecall("historyBridge", function() self:_bridgeHistoryInBackground() end)
+                        end
                     end)
                 end)
             end
@@ -1923,6 +2141,10 @@ function HighlightsDeToto:_offerRemotePosition(opts)
     local flow = self.resume_flow
     if not flow then return false, "no_flow" end
     local local_position = self:_currentPositionSnapshot()
+    do
+        local ok_locator, locator = pcall(self._localLocatorForCompare, self)
+        if ok_locator then local_position.locator = locator end
+    end
     if opts.reading_baseline and opts.reading_baseline.book_hash == book_hash then
         local_position.occurred_at = opts.reading_baseline.occurred_at
         local_position.time_precision = opts.reading_baseline.time_precision
@@ -2069,10 +2291,54 @@ function HighlightsDeToto:_describableRemotePosition(remote)
     local display_page = self:_calcDisplayPage(remote)
     describable.current_page = display_page
     describable.total_pages = self.total_pages or remote.total_pages
+    -- F6: con capitulo mapeable el porcentaje sale de ESTE libro (otra
+    -- edicion con otro prologo ya no dice "mas atras" en falso). Se suma una
+    -- pagina para hablar como _calcLocalPercentage (pagina actual / total).
+    if type(remote.locator) == "table" and self.total_pages and self.total_pages > 0 then
+        local ok, pct = pcall(PositionLocator.localPercent, self.ui, remote.locator, self.total_pages)
+        if ok and pct then
+            describable.comparable_percentage = math.min(100, pct + 100 / self.total_pages)
+        end
+    end
+    local ok_anchor, anchor = pcall(self._remoteAnchor, self, remote)
+    describable.anchor = ok_anchor and anchor or nil
     if not describable.chapter_title and display_page then
         describable.chapter_title = self:_getChapterTitleForPage(display_page)
     end
     return describable
+end
+
+--- F6: que tan firme es la ubicacion de una posicion ajena en ESTE libro
+-- (solo para el texto del aviso; navegar lo decide _navigateToProgress).
+function HighlightsDeToto:_remoteAnchor(remote)
+    if type(remote) ~= "table" then return "approximate" end
+    -- "Exacta" sólo si el XPointer existe Y dice lo mismo que la pantalla del
+    -- otro lector (la misma verificación que hace el salto).
+    if not self.has_pages and self:_isValidXPointer(remote.xpointer)
+        and PositionLocator.verified(self.ui.document, remote.xpointer, remote.locator, self.ui) then
+        return "exact"
+    end
+    local locator = type(remote.locator) == "table" and remote.locator or nil
+    if not self.has_pages and locator and type(locator.text) == "table"
+        and type(locator.text.highlight) == "string" and locator.text.highlight ~= "" then
+        return "text"
+    end
+    if locator and PositionLocator.localChapter(self.ui, locator, self.total_pages) then return "chapter" end
+    return "approximate"
+end
+
+--- F6: el localizador de donde esta este lector, para reconocer el mismo
+-- parrafo que manda otro. Usa la cache del ultimo encolado; si se movio, lo
+-- arma una vez (solo cuando llega una posicion ajena, nunca al pasar pagina).
+function HighlightsDeToto:_localLocatorForCompare()
+    if self.has_pages or not self.ui or not self.ui.getCurrentPage then return nil end
+    local page = self.ui:getCurrentPage()
+    return self:_progressLocator({
+        xpointer = self:_getXPointer(),
+        current_page = page,
+        total_pages = self.total_pages,
+        percentage = self:_calcLocalPercentage(),
+    })
 end
 
 --- La lista completa que va al detalle: sin este lector, que ya se muestra
@@ -2116,20 +2382,159 @@ function HighlightsDeToto:_acceptRemotePosition(book_hash, remote, opts)
         book_hash,
         self:_currentPositionSnapshot()
     )
-    local navigated = self:_navigateToProgress(remote, false)
-    if not navigated then
-        if remembered then self.position_undo:clear(book_hash) end
-        -- Ni se descarta la sugerencia ni se anota la decisión: las dos
-        -- posiciones siguen vivas y el menú puede reintentar.
-        self:showInfo(_("Could not work out that position in this book. You stay where you were and can retry from the menu."), 8)
-        return
-    end
+    self:_locateAndNavigate(remote, function(method, reason)
+        if not method then
+            if remembered then self.position_undo:clear(book_hash) end
+            -- Cerro el libro o se durmio mientras se buscaba: no hay a quien avisar.
+            if reason == "cancelled" then return end
+            -- Ni se descarta la sugerencia ni se anota la decisión: las dos
+            -- posiciones siguen vivas y el menú puede reintentar.
+            self:showInfo(_("Could not work out that position in this book. You stay where you were and can retry from the menu."), 8)
+            return
+        end
+        self._pending_arrived_by = method
+        if not self:_safecall("acceptReadingChoice", function()
+            return self:_finishReadingChoice(book_hash, remote, opts, "accept")
+        end) then
+            self._pending_arrived_by = nil
+            return
+        end
+        self:showInfo(T(HighlightsDeToto.arrivalNotice(method), self.ui:getCurrentPage()), 6)
+    end)
+end
 
-    if not self:_safecall("acceptReadingChoice", function()
-        return self:_finishReadingChoice(book_hash, remote, opts, "accept")
-    end) then return end
-    self:showInfo(T(_("You are on p. %1. You can go back to where you were from the menu."),
-        self.ui:getCurrentPage()), 6)
+-- F6: el aviso despues del salto dice con que metodo se llego.
+function HighlightsDeToto.arrivalNotice(method)
+    if method == "text" then
+        return _("Found the same passage by its text: p. %1. You can go back to where you were from the menu.")
+    elseif method == "chapter" then
+        return _("Placed by chapter, the text was not found: p. %1. You can go back to where you were from the menu.")
+    elseif method == "percentage" then
+        return _("Placed by percentage, it may be a few pages off: p. %1. You can go back to where you were from the menu.")
+    end
+    return _("You are on p. %1. You can go back to where you were from the menu.")
+end
+
+--- Ir a un destino ya resuelto ({xpointer} o {page}).
+function HighlightsDeToto:_gotoTarget(target)
+    if type(target) ~= "table" then return false end
+    -- F2 · un salto del plugin es "sync", no un gesto de la persona.
+    local function jump(event)
+        if self._syncJump then return self:_syncJump(event) end
+        return self.ui:handleEvent(event)
+    end
+    if target.xpointer then
+        jump(Event:new("GotoXPointer", target.xpointer))
+        return true
+    end
+    if target.page then
+        jump(Event:new("GotoPage", target.page))
+        return true
+    end
+    return false
+end
+
+--- F6: la cascada completa, para un "Ir a esa posicion" que toco la persona.
+-- XPointer propio (verificado por texto) -> el texto, buscado en
+-- un proceso HIJO (crengine borra la seleccion al buscar) -> capitulo +
+-- fraccion -> porcentaje. done(method|nil, reason).
+function HighlightsDeToto:_locateAndNavigate(remote, done)
+    done = done or function() end
+    if type(remote) ~= "table" then return done(nil, "no_position") end
+    local opts = {
+        has_pages = self.has_pages == true,
+        total_pages = self.total_pages,
+        same_device = false,
+        percentage = _safePct(remote.percentage),
+    }
+    local target, method = PositionLocator.resolveExact(self.ui, remote, opts)
+    if target then
+        self:_gotoTarget(target)
+        return done(method)
+    end
+    if not self.has_pages and type(remote.xpointer) == "string" and remote.xpointer ~= "" then
+        logger.warn("Borges: remote xpointer not usable here, locating by text:", remote.xpointer)
+    end
+    local function approx()
+        local fallback, how = PositionLocator.resolveApprox(self.ui, remote, opts)
+        if not fallback then return done(nil, "no_position") end
+        self:_gotoTarget(fallback)
+        return done(how)
+    end
+    local locator = type(remote.locator) == "table" and remote.locator or nil
+    local probes = (not self.has_pages and locator) and TextLocate.probes(locator.text) or {}
+    if #probes == 0 then return approx() end
+
+    if self._locate_job then self._locate_job:cancel() end
+    local book, token, epoch = self.book_hash, self.device_token, self._background_epoch
+    local function valid()
+        return self.book_hash == book and self.device_token == token and self._background_epoch == epoch
+            and not self._background_suspended and not self._closed
+    end
+    local document, ui, total = self.ui.document, self.ui, self.total_pages
+    local ctx = {
+        chapterTitleOf = function(xp)
+            return ui.toc and ui.toc.getTocTitleByPage and ui.toc:getTocTitleByPage(xp) or nil
+        end,
+        percentOf = function(xp)
+            local page = document:getPageFromXPointer(xp)
+            if type(page) ~= "number" or not total or total <= 0 then return nil end
+            return page / total * 100
+        end,
+    }
+    -- Es la respuesta a un toque de la persona: los tres puntos dicen que se
+    -- está buscando. Tocar la pantalla lo cierra y CANCELA: no se navega
+    -- después. Toda la búsqueda (las dos sondas) tiene un solo plazo.
+    local job = Background:new{ timeout = TextLocate.SEARCH_SECONDS }
+    local finished = false
+    local message = ProgressMessage:new{
+        text = _("Finding that passage…"),
+        dismissable = true,
+        dismiss_callback = function()
+            if not finished then job:cancel() end
+        end,
+    }
+    UIManager:show(message)
+    self._locate_job = job
+    local found
+    local deadline = os.time() + TextLocate.SEARCH_SECONDS
+    local started = job:run(function()
+        for _index, probe in ipairs(probes) do
+            local remaining = deadline - os.time()
+            if remaining <= 0 then return end
+            local hits = Background.request(TextLocate.searchJob(document, probe), { timeout = remaining })
+            -- Una sonda que venció (o falló) no lanza la otra: es el mismo libro.
+            if type(hits) ~= "table" then return end
+            local chosen = TextLocate.choose(locator, probe, hits, ctx)
+            if chosen then
+                found = chosen
+                found.words_before = probe.words_before
+                return
+            end
+        end
+    end, function(_ok, err)
+        finished = true
+        UIManager:close(message)
+        if self._locate_job == job then self._locate_job = nil end
+        local cancelled = type(err) == "table" and err.code == "background_cancelled"
+        if cancelled or not valid() then return done(nil, "cancelled") end
+        if found and PositionLocator.resolveExact(ui, { xpointer = found.xpointer }, {}) then
+            -- La sonda puede empezar unas palabras (o una pantalla) después de
+            -- donde empezaba la pantalla del otro lector: se vuelve hasta ahí.
+            local target = PositionLocator.walkBack(document, found.xpointer, found.words_before)
+            if not PositionLocator.resolveExact(ui, { xpointer = target }, {}) then target = found.xpointer end
+            self:_gotoTarget({ xpointer = target })
+            logger.info("Borges: remote position found by its text:", found.by, found.score)
+            return done("text")
+        end
+        return approx()
+    end, valid)
+    if not started then
+        finished = true
+        UIManager:close(message)
+        self._locate_job = nil
+        return approx()
+    end
 end
 
 --- "Seguir acá" registra una lectura explícita en la posición local,
@@ -2258,6 +2663,18 @@ function HighlightsDeToto:toggleWifiOnlyToSync()
         Shared.wifi_owned, Shared.wifi_auto_closed = false, false
         Shared.wifi_quiet, Shared.wifi_quiet_failed = nil, false
     end
+    self:saveSyncState()
+end
+
+--- F6: el texto de la pantalla donde quedaste viaja con la posicion para que
+-- otro lector, otra edicion o la web abran el mismo parrafo. Prendido por
+-- defecto; apagado, la posicion viaja sin texto (capitulo y fraccion siguen).
+function HighlightsDeToto:isPositionTextCaptureEnabled()
+    return self.position_text_capture ~= false
+end
+
+function HighlightsDeToto:togglePositionTextCapture()
+    self.position_text_capture = not self:isPositionTextCaptureEnabled()
     self:saveSyncState()
 end
 
@@ -2402,8 +2819,14 @@ end
 
 --- Al suspender con el Wi-Fi que el plugin apago: prenderlo para UN envio.
 -- Si conectar no llega a tiempo KOReader lo mata al dormir y todo queda en la
--- cola, igual que hoy cuando no hay red al suspender.
+-- cola, igual que hoy cuando no hay red al suspender. El envio es el mismo
+-- intercambio acotado de dormir (`_drainQueueBlocking`, `SleepBudget`): su
+-- tope de 8 s queda por debajo de la ventana de SLEEP_UPLOAD_WINDOW.
 function HighlightsDeToto:_uploadBeforeSleep()
+    -- El explorador detras de un libro abierto no toca las marcas compartidas:
+    -- si las consumiera, prenderia el Wi-Fi para un drenaje que le deja el
+    -- intercambio al libro, y el libro ya no las encontraria (0 pedidos).
+    if self:_leavesSleepToOpenBook() then return end
     -- Tambien cuando la conexion silenciosa del despertar no llego a conectar:
     -- lo leido en esta sesion sube igual, por el camino que prueba todas las
     -- redes guardadas.
@@ -2461,26 +2884,45 @@ end
 -- decide, y una lectura mas nueva en otro aparato la mantiene retenida.
 -- `force` saltea el intervalo: al dormir o al cortarse el Wi-Fi es la ultima
 -- oportunidad.
-function HighlightsDeToto:_resolveHeldProgress(force)
-    if not self.device_token or not self.sync_v2 or not self.queue then return 0 end
-    if not NetworkMgr:isConnected() then return 0 end
+-- `max_books` acota las consultas (al dormir, una: `SleepBudget.FOCUS_CHECKS`)
+-- y el libro abierto va primero. `quick` viaja a la red (`"sleep"` pide los
+-- plazos de dormir). Devuelve cuantas se hicieron y si alguna fallo por red.
+function HighlightsDeToto:_resolveHeldProgress(force, max_books, quick)
+    if not self.device_token or not self.sync_v2 or not self.queue then return 0, false end
+    if not NetworkMgr:isConnected() then return 0, false end
     -- Otra consulta de la ultima lectura esta en vuelo: su resultado decide.
     -- Con vencimiento: una corrutina cancelada a mitad de pedido no baja el
     -- contador, y eso no puede apagar esta red de seguridad para siempre.
     if (self.sync_v2.focus_in_flight or 0) > 0
         and os.time() - (self.sync_v2.focus_started_at or 0) < HELD_CHECK_INTERVAL * 2 then
-        return 0
+        return 0, false
     end
     local held = self.queue:heldProgressIdentifiers()
-    if #held == 0 then return 0 end
+    if #held == 0 then return 0, false end
+    max_books = tonumber(max_books) or HELD_CHECK_MAX_BOOKS
+    if quick == nil then quick = true end
+    -- El libro abierto primero: es el que la persona va a retomar.
+    -- Abierto es el MISMO libro: con clave, la clave; una retencion de antes
+    -- de la clave (sin ella) se reconoce por el hash, como siempre.
+    local function isOpen(identifier)
+        if identifier.value ~= self.book_hash then return false end
+        return identifier.book_key == nil or self.book_key == nil or identifier.book_key == self.book_key
+    end
+    local ordered = {}
+    for _, identifier in ipairs(held) do
+        if isOpen(identifier) then table.insert(ordered, 1, identifier)
+        else table.insert(ordered, identifier) end
+    end
+    held = ordered
     local now = os.time()
     self._held_checked_at = self._held_checked_at or {}
-    local checked = 0
+    local checked, failed = 0, false
     for _, identifier in ipairs(held) do
-        if checked >= HELD_CHECK_MAX_BOOKS then break end
-        local key = identifier.kind .. ":" .. tostring(identifier.value)
+        -- Sin red la proxima consulta tambien va a fallar: no se la espera.
+        if checked >= max_books or failed then break end
+        local key = identifier.book_key or (identifier.kind .. ":" .. tostring(identifier.value))
         local last = self._held_checked_at[key]
-        local open = identifier.value == self.book_hash
+        local open = isOpen(identifier)
         -- Con una eleccion en pantalla, o la consulta de conexion en curso, el
         -- libro abierto ya esta preguntando: otra consulta la invalidaria.
         local busy = open and ((self._reading_head and self._reading_head.ask) or self._connect_sync_running)
@@ -2488,16 +2930,20 @@ function HighlightsDeToto:_resolveHeldProgress(force)
             self._held_checked_at[key] = now
             checked = checked + 1
             local context = not open and { book_hash = identifier.value, token = self.device_token,
-                epoch = self._background_epoch, closed = true } or nil
-            local ok, err = self.sync_v2:pull(true, identifier, true, context)
+                epoch = self._background_epoch, closed = true,
+                book_key = identifier.book_key, hint = identifier.hint } or nil
+            -- Al servidor viaja el identificador de siempre, sin lo local.
+            local focus = { kind = identifier.kind, value = identifier.value }
+            local ok, err = self.sync_v2:pull(quick, focus, true, context)
             if not ok then
                 logger.warn("Borges: last reading not confirmed, position stays held:", tostring(err))
+                if type(err) == "table" and err.code == "connection_failed" then failed = true end
             end
         end
     end
     -- Dormido no se pregunta nada: la eleccion pendiente espera al despertar.
     if checked > 0 and self._background_suspended then self:_clearReadingHead() end
-    return checked
+    return checked, failed
 end
 
 --- Called when a book is opened and ready to read.
@@ -2518,6 +2964,9 @@ function HighlightsDeToto:onReaderReady()
             local props = self.ui.document:getProps()
             self.book_title = props.title or ""
             self.book_author = props.authors or props.author or ""
+            -- ISBN / UUID que trae el archivo: una vez por apertura.
+            self.book_identifiers = type(props.identifiers) == "string" and props.identifiers or nil
+            self._book_language = props.language
             self.total_pages = self.ui.document:getPageCount()
             -- ReaderAnnotation decides compatibility with ui.paging/ui.rolling.
             -- Keep has_pages aligned with that, falling back to document.info for older builds.
@@ -2533,10 +2982,27 @@ function HighlightsDeToto:onReaderReady()
             self.book_file_path = self.ui.document.file or ""
             -- Extract book filename for display/fallback
             self.book_filename = self.book_file_path:match("([^/\\]+)$") or ""
-            self._annotation_pull_backed_up = false
+            -- F5 · La clave local del libro (hash + archivo + titulo) y la
+            -- mudanza de lo guardado por hash: una vez por apertura, en memoria;
+            -- sale con el proximo guardado de la cola.
+            self.book_key = BookKey.forDocument(self.ui)
+            self:_safecall("bookKeyMigrate", function() self:_adoptBookKeyState() end)
+            -- F2 · antes del primer tramo: el que abre F1 sale con causa "open".
+            if self._attentionInstall then
+                local installed, install_err = pcall(self._attentionInstall, self)
+                if not installed then logger.warn("Borges: attentionInstall error:", install_err) end
+            end
+            -- La posicion de partida se lee UNA vez y la usa tambien el primer
+            -- tramo de F1 (antes eran dos lecturas de crengine al abrir).
             self._last_handled_page = self.ui:getCurrentPage()
             self._last_handled_xpointer = self._getXPointer and self:_getXPointer()
             self._last_handled_page_at = os.time()
+            if self._startReadingLog then
+                local started, start_err = pcall(self._startReadingLog, self, self._last_handled_xpointer)
+                if not started then logger.warn("Borges: readingLogStart error:", start_err) end
+            end
+            self._annotation_pull_backed_up = false
+            self._locator_cache, self._locator_error_logged = nil, nil
             local activity = self.ui.doc_settings:readSetting("toto_reading_activity")
             self._reading_activity_at = type(activity) == "table"
                 and activity.device_id == (self.paired_device_id or self.device_id) and activity.occurred_at or nil
@@ -2581,10 +3047,19 @@ function HighlightsDeToto:onCloseDocument()
 
     if not self.book_hash then return end
 
+    -- 0. F1 · el ultimo tramo termina mientras el documento sigue disponible.
+    if self._sampleDeviceState then self:_sampleDeviceState("close") end
+    if self.reading_log then
+        local close_fields = self._attention and self:_attentionCloseFields(nil, "close") or nil
+        self:_safecall("readingClose", function() self.reading_log:close(close_fields) end)
+    end
+
     -- 1. Capture final progress while this document is still available.
     -- Posicion, sesion, estadisticas y subrayados se guardan juntos al final,
     -- en una escritura de la cola.
     self:_safecall("pushProgress", function() self:_enqueueProgressV2(false, true) end)
+    -- F6: el texto de la pantalla no sobrevive al libro cerrado.
+    self._locator_cache = nil
 
     -- 2. Finish session and ENQUEUE (payload is tiny ~200B, drain will send it)
     self:_safecall("session", function()
@@ -2597,6 +3072,11 @@ function HighlightsDeToto:onCloseDocument()
     -- cierra): aca solo se dejan las anotaciones listas para comparar.
     self:_safecall("prepareAnnotations", function() self:_flushSidecar() end)
 
+    -- F1 · los tramos entran antes de las estadisticas: syncPageStatsDelta guarda la
+    -- cola si encolo filas, y asi ese mismo guardado los lleva (ninguna escritura nueva).
+    if self.reading_log then self:_safecall("readingSpans", function() self:_enqueueReadingSpans(true) end) end
+    -- F2 · las condiciones del libro que se cierra, en esta misma escritura.
+    if self._enqueueDeviceStates then self:_safecall("deviceStates", function() self:_enqueueDeviceStates() end) end
     -- 4. Persist the statistics delta for the same background drain.
     self:_safecall("statsSync", function()
         self:syncPageStatsDelta(true)
@@ -2613,6 +3093,7 @@ function HighlightsDeToto:onCloseDocument()
     -- compuerta trabada: el próximo libro no mostraría nada.
     if self.resume_flow then self.resume_flow:clearVisible() end
     self.book_hash = nil
+    self.book_key = nil
     self.book_file_path = nil
     self.has_pages = nil
     self._annotation_pull_backed_up = nil
@@ -2621,6 +3102,9 @@ function HighlightsDeToto:onCloseDocument()
     self._last_handled_page = nil
     self._last_handled_xpointer = nil
     self._last_handled_page_at = nil
+    self.reading_log = nil
+    if self._unregisterFooterTimeLeft then pcall(self._unregisterFooterTimeLeft, self) end
+    self._server_pace = nil
 
     -- 6. Send the durable work after returning control to the reader. Para
     -- entonces esta instancia ya no existe: lo manda la que la reemplazo, que
@@ -2642,9 +3126,801 @@ function HighlightsDeToto:onCloseDocument()
     end)
 end
 
---- Called when user navigates to a new page (paged documents like PDF).
+--- Called when user navigates to a new page (paged view, and page turns in
+-- crengine's page mode).
 function HighlightsDeToto:onPageUpdate(pageno)
-    self:_handlePageChange(pageno)
+    self:_noteScreenMoved("page", nil, pageno)
+end
+
+--- Vista continua: KOReader avisa `PosUpdate(pos, page)` al desplazarse, no
+-- `PageUpdate`. Sin esto, leer en vista continua no movia la posicion.
+function HighlightsDeToto:onPosUpdate(pos, page)
+    self:_noteScreenMoved("pos", pos, page)
+end
+
+--- CAMINO CALIENTE: corre en cada paso de pagina o desplazamiento. Solo anota
+-- en memoria y difiere el trabajo con `tickAfterNext` (una tarea pendiente a
+-- la vez, sin reloj). Prohibido aca: disco, red, temporizadores, widgets y
+-- crengine. Otros registros de lectura en memoria se cuelgan de esta funcion.
+function HighlightsDeToto:_noteScreenMoved(kind, pos, page)
+    if not self.book_hash or self._closed then return end
+    local pending = self._screen_move ~= nil
+    self._screen_move = { kind = kind, pos = pos, page = page }
+    if not pending and self._screen_move_task then
+        UIManager:tickAfterNext(self._screen_move_task)
+    end
+    -- F1 · lectura en palabras: solo el instante (reloj ya leido en este tick).
+    if self.reading_log then
+        local ok, at = pcall(self._readingClockMs, self)
+        if ok then self._reading_move_at = at end
+    end
+    -- F2 · la marca del gesto existe solo mientras corre la llamada que movio la
+    -- pantalla (este aviso es sincronico): se lee aca, en memoria. Ni disco ni
+    -- reloj nuevo: getTime y el standby ya estan leidos en este tick.
+    if self._nav or self._attention then pcall(self._attentionNoteMove, self, self._screen_move) end
+end
+
+-- ============================================================
+-- F1 · Lectura medida en palabras
+-- ============================================================
+-- Cada pantalla a la vista es un tramo del registro en memoria (readinglog.lua):
+-- donde empieza, cuando aparecio y cuanto estuvo. El aviso de pagina solo toma
+-- el instante; el XPointer, el fin, el porcentaje y las palabras se resuelven
+-- en la tarea diferida (tickAfterNext, despues del pintado). Nada de esto
+-- escribe en disco: los tramos salen a la cola en las escrituras de siempre.
+
+--- Reloj de lectura en ms: el monotonico de UIManager (ya leido en este tick)
+-- mas el tiempo en standby. En Kobo CLOCK_MONOTONIC no avanza en standby y
+-- una pagina de tres minutos con el procesador dormido mediria segundos. La
+-- suspension no entra: suspender cierra el tramo.
+function HighlightsDeToto:_readingClockMs()
+    -- `time.now()` (CLOCK_MONOTONIC_COARSE) y no `UIManager:getTime()`: ese es
+    -- `_now`, que UIManager refresca ANTES de esperar la entrada, así que dentro
+    -- de un toque es la hora del evento anterior y el tiempo de cada pantalla
+    -- caía en la siguiente. Es una lectura de reloj por FFI, sin E/S. Como
+    -- getTime, no avanza con el aparato suspendido (Linux) ni en el standby del
+    -- Kobo; el standby se suma aparte y la suspensión cierra el tramo.
+    local now
+    if UITime and type(UITime.now) == "function" then
+        local ok, value = pcall(UITime.now)
+        if ok then now = value end
+    end
+    if type(now) ~= "number" then now = UIManager.getTime and UIManager:getTime() end
+    local standby = Device.total_standby_time
+    if type(standby) ~= "number" then standby = 0 end
+    if UITime and type(UITime.to_ms) == "function" and type(now) == "number" then
+        return UITime.to_ms(now + standby)
+    end
+    return os.time() * 1000
+end
+
+--- Hora de pared en ms, anclada al reloj de lectura: sin llamadas al sistema.
+function HighlightsDeToto:_readingWallMs(mono_ms)
+    mono_ms = mono_ms or self:_readingClockMs()
+    if not self._wall_anchor_ms or not self._mono_anchor_ms then self:_anchorReadingClock() end
+    return self._wall_anchor_ms + (mono_ms - self._mono_anchor_ms)
+end
+
+function HighlightsDeToto:_anchorReadingClock()
+    self._mono_anchor_ms = self:_readingClockMs()
+    local wall
+    if UITime and type(UITime.realtime) == "function" and type(UITime.to_ms) == "function" then
+        local ok, value = pcall(UITime.realtime)
+        if ok and type(value) == "number" then wall = UITime.to_ms(value) end
+    end
+    self._wall_anchor_ms = wall or os.time() * 1000
+end
+
+function HighlightsDeToto:isReadingSpansEnabled()
+    return self.reading_spans_enabled ~= false
+end
+
+function HighlightsDeToto:_readingViewMode()
+    if self.has_pages then return "paging" end
+    local view = self.ui and self.ui.view
+    if type(view) == "table" and view.view_mode == "scroll" then return "scroll" end
+    return "page"
+end
+
+function HighlightsDeToto:_readVisiblePages()
+    local document = self.ui and self.ui.document
+    if type(document) == "table" and type(document.getVisiblePageNumberCount) == "function" then
+        local ok, value = pcall(document.getVisiblePageNumberCount, document)
+        if ok and type(value) == "number" and value >= 1 then return value end
+    end
+    return 1
+end
+
+--- Un registro por libro abierto, en la instancia (la cola sigue en Shared).
+-- `xpointer`: la posicion que la apertura acaba de leer (si la hay), para no
+-- volver a preguntarle a crengine.
+function HighlightsDeToto:_startReadingLog(xpointer)
+    self.reading_log = nil
+    if not self.book_hash then return end
+    -- El ritmo que mando el servidor la ultima vez sirve sin red.
+    local saved = self.ui and self.ui.doc_settings and self.ui.doc_settings:readSetting("borges_reading_pace")
+    if type(saved) == "table" then self._server_pace = { book = saved.book, account = saved.account } end
+    self:_registerFooterTimeLeft()
+    if not self:isReadingSpansEnabled() then return end
+    self:_anchorReadingClock()
+    self.reading_log = ReadingLog:new{
+        clock_ms = function() return self:_readingClockMs() end,
+        wall_ms = function() return self:_readingWallMs() end,
+    }
+    self._visible_pages = self:_readVisiblePages()
+    self:_recordReadingScreen(nil, { force = true, defer_resolve = true, xpointer = xpointer })
+end
+
+--- Registrar la pantalla actual. `move` es lo que anoto el aviso de pagina
+-- (nil al abrir, despertar o re-renderizar, que van con `force`).
+function HighlightsDeToto:_recordReadingScreen(move, opts)
+    opts = opts or {}
+    local log = self.reading_log
+    if not log or not self.book_hash or self._closed or not self:isReadingSpansEnabled() then return end
+    local previous = log.open
+    local view_mode = self:_readingViewMode()
+    -- En vista paginada _gotoPercent tambien emite PosUpdate: PageUpdate ya lo cubre.
+    if move and move.kind == "pos" and view_mode == "page" then return end
+    local at = self._reading_move_at or self:_readingClockMs()
+    self._reading_move_at = nil
+    local xp_start
+    if view_mode ~= "paging" then
+        if move then xp_start = self._last_handled_xpointer end
+        xp_start = xp_start or opts.xpointer or self:_getXPointer()
+    end
+    local page = move and move.page
+    if page == nil and self.ui and self.ui.getCurrentPage then page = self.ui:getCurrentPage() end
+    local span = log:onScreen({
+        xp_start = xp_start, page = page, page_count = self.total_pages,
+        visible_pages = self._visible_pages or 1, view_mode = view_mode,
+    }, { force = opts.force, now_ms = at, wall_ms = self:_readingWallMs(at),
+        close_fields = self._attention and self._attentionCloseFields and self:_attentionCloseFields(move, "screen") or nil })
+    if not span then return end
+    -- F2 · solo si de verdad aparecio una pantalla nueva.
+    if span ~= previous and self._attentionOpened then self:_attentionOpened(move, view_mode) end
+    if opts.defer_resolve then
+        self:_scheduleReadingResolve()
+    else
+        self:_resolveReadingSpans(2)
+    end
+end
+
+--- Una sola resolucion pendiente a la vez, despues del pintado. tickAfterNext
+-- no deja ningun temporizador vivo.
+function HighlightsDeToto:_scheduleReadingResolve()
+    if self._reading_resolve_pending then return end
+    self._reading_resolve_pending = true
+    local log = self.reading_log
+    UIManager:tickAfterNext(function()
+        self._reading_resolve_pending = nil
+        if self._closed or self.reading_log ~= log then return end
+        self:_safecall("readingResolve", function() self:_resolveReadingSpans(2) end)
+    end)
+end
+
+function HighlightsDeToto:_readingTocIndex(page)
+    local toc = self.ui and self.ui.toc
+    if not page or type(toc) ~= "table" or type(toc.getTocIndexByPage) ~= "function" then return nil end
+    local ok, index = pcall(toc.getTocIndexByPage, toc, page)
+    if ok and type(index) == "number" and index > 0 then return index end
+    return nil
+end
+
+--- El XPointer del tramo que siguio a `span`, si la lectura fue seguida.
+function HighlightsDeToto:_readingSequentialEnd(log, span)
+    for index, candidate in ipairs(log.closed) do
+        if candidate == span then
+            local nxt = log.closed[index + 1] or log.open
+            if nxt and span.view_mode == "page" and nxt.view_mode == "page" and span.page and nxt.page
+                and nxt.page == span.page + (span.visible_pages or 1) then
+                return nxt.xp_start
+            end
+            -- Vista continua: lo leído en una posición de reposo es lo que se
+            -- desplazó hasta la siguiente (el texto nuevo que entró), no hasta el
+            -- corte de página de crengine, que no tiene que ver con el borde de
+            -- la pantalla. Sólo hacia adelante; un salto lo frena el tope.
+            if nxt and span.view_mode == "scroll" and nxt.view_mode == "scroll" then
+                return nxt.xp_start, true
+            end
+            if not nxt and span.view_mode == "scroll" and index == #log.closed then
+                -- La última antes de dormir o cerrar: la pantalla sigue a la vista.
+                return nil, false, true
+            end
+            return nil
+        end
+    end
+    return nil
+end
+
+--- Completar fin, porcentaje, capitulo y palabras de los tramos pendientes.
+-- Solo se le pide texto a crengine si es seguro (DocText.safe) y solo una vez
+-- por par de XPointers (relectura = acierto de cache). Devuelve cuantos conto.
+function HighlightsDeToto:_resolveReadingSpans(limit)
+    local log = self.reading_log
+    if not log or self._closed or not self.ui then return 0 end
+    local counted = 0
+    local document = self.ui.document
+    for _, span in ipairs(log:unresolved(limit or 2)) do
+        -- Vista continua: el tramo abierto se resuelve al cerrarse, con la
+        -- posicion siguiente (ver _readingSequentialEnd).
+        if not (span == log.open and span.view_mode == "scroll") then
+            local fields = { toc_index = self:_readingTocIndex(span.page) }
+            local ready = true
+            if span.view_mode == "paging" then
+                local count = span.page_count or self.total_pages
+                if span.page and count and count > 0 then
+                    fields.percent_start = math.max(0, math.min(1, (span.page - 1) / count))
+                    fields.percent_end = math.max(0, math.min(1, (span.page + (span.visible_pages or 1) - 1) / count))
+                end
+            else
+                local xp_end, scrolled, last_in_view
+                if span == log.open then
+                    local _, bound = DocText.screenBounds(self.ui, span.xp_start)
+                    xp_end = bound
+                elseif span.xp_end then
+                    xp_end = span.xp_end
+                else
+                    xp_end, scrolled, last_in_view = self:_readingSequentialEnd(log, span)
+                    if last_in_view then
+                        local _, bound = DocText.screenBounds(self.ui, span.xp_start)
+                        xp_end = bound
+                    end
+                end
+                fields.percent_start = DocText.percentOf(document, span.xp_start)
+                fields.percent_end = xp_end and DocText.percentOf(document, xp_end) or nil
+                if scrolled and not (fields.percent_end and fields.percent_start
+                    and fields.percent_end > fields.percent_start) then
+                    -- Desplazarse hacia atrás no muestra texto nuevo.
+                    xp_end, fields.percent_end = nil, nil
+                end
+                fields.xp_end = xp_end
+                if span.xp_start and xp_end then
+                    local words, chars = log:cachedCount(span.xp_start, xp_end)
+                    if words == nil then
+                        if DocText.safe(self.ui) then
+                            local text = DocText.between(document, span.xp_start, xp_end)
+                            if text then
+                                words, chars = DocText.countWords(text)
+                                log:rememberCount(span.xp_start, xp_end, words, chars)
+                                counted = counted + 1
+                            end
+                        else
+                            -- Seleccion, diccionario o busqueda abiertos: se cuenta despues.
+                            ready = false
+                        end
+                    end
+                    if scrolled and words and words > ReadingLog.SCROLL_JUMP_WORDS then
+                        -- Más de lo que entra en unas pantallas: fue un salto, no lectura.
+                        fields.xp_end, fields.percent_end, words, chars = nil, nil, nil, nil
+                    end
+                    fields.words, fields.chars = words, chars
+                end
+            end
+            if ready then log:resolve(span, fields) end
+        end
+    end
+    return counted
+end
+
+-- ============================================================
+-- F2 · Causa de cada pantalla, pausas y condiciones de lectura
+-- ============================================================
+-- Cada tramo de F1 lleva por que aparecio (`cause`: pasar pagina, indice,
+-- busqueda, volver...), hasta el ultimo toque (`active_ms`) y como termino
+-- (`ended_by`). Es una cota de presencia, NO atencion: lo plausible lo decide
+-- el servidor. Ademas, cada tanto, las condiciones de lectura (bateria, luz,
+-- letra) en `device_state.recorded`.
+--
+-- Camino caliente: los envoltorios de navcause.lua solo asignan campos; el
+-- aviso de pagina copia la marca y un numero que UIManager ya tiene. Nada de
+-- disco, red, temporizadores ni crengine. Lo capturado sale en las mismas
+-- escrituras de la cola que F1 (guardar ajustes, dormir, cerrar el libro).
+
+local DEVICE_STATE_EVENT_BYTES = 28 * 1024
+local DEVICE_STATE_EVENT_ROWS = 100
+
+function HighlightsDeToto:isNavCauseEnabled() return self.capture_nav_cause ~= false end
+function HighlightsDeToto:isAttentionEnabled() return self.capture_attention ~= false end
+function HighlightsDeToto:isDeviceStateEnabled() return self.capture_device_state ~= false end
+
+function HighlightsDeToto:_attentionDeps()
+    return { UIManager = UIManager, Device = Device, time = UITime }
+end
+
+--- El mismo reloj que los tramos (_readingClockMs): time.now() en el momento
+-- mas el standby, en fts. Asi active_ms nunca puede pasar a dwell_ms.
+function HighlightsDeToto:_attentionNow()
+    return Attention.clock(self:_attentionDeps())
+end
+
+--- En onReaderReady, ANTES de que F1 abra el primer tramo.
+function HighlightsDeToto:_attentionInstall()
+    if self._nav then self._nav:close() end
+    self._nav, self._attention, self._pending_cause = nil, nil, nil
+    if not self.book_hash or not self.ui then return end
+    if self:isNavCauseEnabled() then
+        local nav = NavCause.new(self.ui, function() return UIManager:getTime() end, UIManager)
+        local installed, missing = nav:install()
+        if missing > 0 then logger.info("Borges: navcause installed", installed, "missing", missing) end
+        self._nav = nav
+        self._pending_cause = "open"
+    end
+    if self:isAttentionEnabled() then
+        Attention.installProcessHooks(Shared, self:_attentionDeps())
+        self._attention = Attention.new(Shared, self:_attentionDeps())
+    end
+    self:_sampleDeviceState("open")
+end
+
+--- CAMINO CALIENTE (desde _noteScreenMoved): la marca del gesto existe solo
+-- mientras corre la llamada que movio la pantalla.
+function HighlightsDeToto:_attentionNoteMove(move)
+    if type(move) ~= "table" then return end
+    if self._nav then
+        local view = self.ui and self.ui.view
+        move.cause = self._nav:take(view and view.view_mode)
+    end
+    if self._attention then move.att_fts = self:_attentionNow() end
+end
+
+--- Lo que se le anota al tramo que cierra (lo usa ReadingLog:onScreen/close).
+function HighlightsDeToto:_attentionCloseFields(move, ended_by)
+    local att = self._attention
+    if not att or not att:isOpen() then return nil end
+    local now = move and move.att_fts or self:_attentionNow()
+    local ok, measured = pcall(att.measure, att, now, ended_by)
+    if not ok or not measured then return nil end
+    return { active_ms = measured.active_ms, ended_by = measured.ended_by }
+end
+
+--- Al dormir: el motivo (boton, tapa, inactividad) y hasta el ultimo toque.
+function HighlightsDeToto:_attentionSleepFields()
+    local att = self._attention
+    local log = self.reading_log
+    if not att or not att:isOpen() or not log or not log.open then return nil end
+    local now = self:_attentionNow()
+    local autosuspend = self.ui and self.ui.autosuspend
+    local timeout = type(autosuspend) == "table" and tonumber(autosuspend.auto_suspend_timeout_seconds) or nil
+    local ok, result = pcall(function()
+        return att:closeSpan(now, att:sleepReason(now, timeout))
+    end)
+    if not ok or not result then return nil end
+    return { active_ms = result.active_ms, ended_by = result.ended_by }
+end
+
+--- Una pantalla nueva: su causa y el comienzo del reloj de toques.
+function HighlightsDeToto:_attentionOpened(move, view_mode)
+    local cause = self._pending_cause
+    self._pending_cause = nil
+    if self._nav and self.reading_log then
+        if not cause then cause = move and move.cause or self._nav:take(view_mode) end
+        self.reading_log:annotate({ cause = cause })
+    end
+    if self._attention then
+        self._attention:openSpan(move and move.att_fts or self:_attentionNow())
+    end
+end
+
+--- Los saltos del propio plugin (otra lectura, otro lector) son "sync", no un
+-- gesto de la persona: F6/F7 los distinguen asi.
+function HighlightsDeToto:_syncJump(event)
+    if self._nav and self.ui then
+        return self._nav:scoped("sync", function() return self.ui:handleEvent(event) end)
+    end
+    return self.ui:handleEvent(event)
+end
+
+function HighlightsDeToto:_deviceStateStore()
+    if not Shared.device_state then
+        Shared.device_state = DeviceState.new({
+            Device = Device, powerd = Device.powerd, G_reader_settings = G_reader_settings,
+            Screen = Device.screen, NetworkMgr = NetworkMgr, os = os,
+        })
+    end
+    return Shared.device_state
+end
+
+--- Una muestra de condiciones. Solo desde avisos de KOReader y de los momentos
+-- en que el plugin ya escribe: nunca al pasar pagina.
+function HighlightsDeToto:_sampleDeviceState(trigger)
+    if self._closed or not self:isDeviceStateEnabled() then return end
+    local ok, err = pcall(function()
+        local store = self:_deviceStateStore()
+        -- Dormir puede avisarse dos veces (al cortar la red y al suspender).
+        local last = store.last
+        if trigger == "sleep" and last and last.trigger == "sleep" and last.at_ms
+            and os.time() * 1000 - last.at_ms < 60000 then
+            return
+        end
+        local reading = self.book_hash and self.ui and self.ui.document and self.ui or nil
+        store:sample(trigger, reading, self.book_hash)
+    end)
+    if not ok then logger.warn("Borges: deviceState error:", err) end
+end
+
+--- Las muestras viajan con los tramos. Si se juntan muchas sin tramos (medir
+-- en palabras apagado, un lector que solo duerme y despierta), salen solas en
+-- la proxima escritura que ya ocurre, antes de que el tope de 200 las recorte.
+local DEVICE_STATE_PILE = 150
+function HighlightsDeToto:_deviceStatesPiledUp()
+    local store = Shared.device_state
+    return store ~= nil and store:count() >= DEVICE_STATE_PILE
+end
+
+--- Las muestras a la cola, en grupos de a lo sumo 100 y 28 KB, un evento por
+-- libro. Lo llaman los mismos lugares que encolan los tramos de F1: no agrega
+-- ninguna escritura. Devuelve cuantos eventos encolo.
+function HighlightsDeToto:_enqueueDeviceStates()
+    local store = Shared.device_state
+    if not store or store:count() == 0 or not self.sync_v2 then return 0 end
+    local samples = store:drain()
+    if not self:isDeviceStateEnabled() then return 0 end
+    local device_id = tostring(self.paired_device_id or self.device_id or "reader")
+    local enqueued = 0
+    local group, group_book, size = {}, nil, 0
+    local function emit()
+        if #group == 0 then return end
+        local first, last = group[1], group[#group]
+        enqueued = enqueued + 1
+        self.sync_v2:enqueue({
+            event_type = "device_state.recorded",
+            aggregate_type = "device_state",
+            aggregate_id = "device_state:" .. device_id .. ":" .. string.format("%.0f", first.at_ms or 0)
+                .. ":" .. enqueued,
+            book_identifier = group_book and self:_bookIdentifier(group_book) or nil,
+            occurred_at = os.date("!%Y-%m-%dT%H:%M:%SZ", math.floor((last.at_ms or 0) / 1000)),
+            time_precision = "exact",
+            payload = { v = 1, samples = group },
+        }, { defer = true })
+        group, size = {}, 0
+    end
+    for _, raw in ipairs(samples) do
+        local wire = DeviceState.wire(raw)
+        local bytes = #rapidjson.encode(wire) + 1
+        if raw._book ~= group_book or #group >= DEVICE_STATE_EVENT_ROWS
+            or size + bytes > DEVICE_STATE_EVENT_BYTES - 256 then
+            emit()
+            group_book = raw._book
+        end
+        table.insert(group, wire)
+        size = size + bytes
+    end
+    emit()
+    return enqueued
+end
+
+-- Avisos de KOReader que cambian una condicion. Ninguno devuelve true: el
+-- aviso sigue su camino.
+function HighlightsDeToto:onFrontlightStateChanged() self:_sampleDeviceState("frontlight") end
+-- Enchufar llega como entrada falsa: el gancho de toques ya corrio, y no fue
+-- la persona tocando la pantalla.
+function HighlightsDeToto:onCharging()
+    Attention.forgetSystemInput(Shared, self:_attentionDeps())
+    self:_sampleDeviceState("charging")
+end
+function HighlightsDeToto:onNotCharging()
+    Attention.forgetSystemInput(Shared, self:_attentionDeps())
+    self:_sampleDeviceState("not_charging")
+end
+function HighlightsDeToto:onSetRotationMode() self:_sampleDeviceState("rotation") end
+function HighlightsDeToto:onToggleNightMode() self:_sampleDeviceState("night_mode") end
+function HighlightsDeToto:onSetNightMode() self:_sampleDeviceState("night_mode") end
+
+function HighlightsDeToto:toggleNavCause()
+    self.capture_nav_cause = not self:isNavCauseEnabled()
+    if not self.capture_nav_cause then
+        if self._nav then self._nav:close() end
+        self._nav = nil
+    elseif self.book_hash and not self._nav and self.ui then
+        self._nav = NavCause.new(self.ui, function() return UIManager:getTime() end, UIManager)
+        self._nav:install()
+    end
+    self:saveSyncState()
+end
+
+function HighlightsDeToto:toggleAttentionCapture()
+    self.capture_attention = not self:isAttentionEnabled()
+    if not self.capture_attention then
+        self._attention = nil
+    elseif self.book_hash and not self._attention then
+        Attention.installProcessHooks(Shared, self:_attentionDeps())
+        self._attention = Attention.new(Shared, self:_attentionDeps())
+    end
+    self:saveSyncState()
+end
+
+function HighlightsDeToto:toggleDeviceStateCapture()
+    self.capture_device_state = not self:isDeviceStateEnabled()
+    -- Apagar no manda nada mas: lo que estaba en memoria se descarta.
+    if not self.capture_device_state and Shared.device_state then Shared.device_state:drain() end
+    self:saveSyncState()
+end
+
+function HighlightsDeToto:toggleReadingSpans()
+    self.reading_spans_enabled = not self:isReadingSpansEnabled()
+    if self.reading_spans_enabled then
+        if self.book_hash and not self.reading_log then self:_startReadingLog() end
+    else
+        -- Apagar no manda nada mas: lo que estaba en memoria se descarta.
+        self.reading_log = nil
+    end
+    self:saveSyncState()
+end
+
+-- ------------------------------------------------------------
+-- F1 · Tiempo restante en la barra de estado de KOReader
+-- ------------------------------------------------------------
+-- Es un item de «Contenido externo» (ReaderFooter:addAdditionalFooterContent):
+-- KOReader lo llama en cada refresco del pie, o sea en cada pagina. Por eso
+-- es solo aritmetica sobre numeros ya en memoria, mas getChapterPagesLeft, que
+-- es lo mismo que KOReader pide para su propio tiempo del capitulo.
+
+function HighlightsDeToto:isFooterTimeLeftEnabled()
+    return self.footer_time_left ~= false
+end
+
+--- Velocidad para estimar: la del servidor para este libro si ya tiene
+-- suficiente; si no, la de esta lectura; si no, la de toda la cuenta.
+function HighlightsDeToto:_readingPaceWpm()
+    local server = type(self._server_pace) == "table" and self._server_pace or {}
+    local book = type(server.book) == "table" and server.book or nil
+    if book and tonumber(book.wpm) and (tonumber(book.words) or 0) >= ReadingLog.MIN_BOOK_PACE_WORDS then
+        return tonumber(book.wpm)
+    end
+    local log = self.reading_log
+    if log then
+        local pace = log:pace()
+        if pace.words >= ReadingLog.MIN_BOOK_PACE_WORDS and pace.ms > 0 then
+            return pace.words * 60000 / pace.ms
+        end
+    end
+    local account = type(server.account) == "table" and server.account or nil
+    if account and tonumber(account.wpm) and tonumber(account.wpm) > 0 then return tonumber(account.wpm) end
+    return nil
+end
+
+--- Donde esta la persona (0..1), sin pedirle nada a crengine.
+function HighlightsDeToto:_readingPosition(page)
+    local open = self.reading_log and self.reading_log.open
+    if open and type(open.percent_start) == "number" and (open.page == nil or open.page == page) then
+        return open.percent_start
+    end
+    if page and self.total_pages and self.total_pages > 0 then
+        return math.max(0, math.min(1, (page - 1) / self.total_pages))
+    end
+    return nil
+end
+
+--- Palabras que faltan: con el total del EPUB si el servidor lo tiene; si no,
+-- con la densidad de lo ya leido en este libro (al menos el 5 % cubierto).
+function HighlightsDeToto:_readingWordsLeft(position)
+    local server = type(self._server_pace) == "table" and self._server_pace or {}
+    local total = type(server.book) == "table" and tonumber(server.book.words_total) or nil
+    if total and total > 0 then return total * (1 - position) end
+    local log = self.reading_log
+    if not log then return nil end
+    local density, covered = log:density()
+    if density and covered >= 0.05 then return density * (1 - position) end
+    return nil
+end
+
+local function clockDuration(seconds)
+    seconds = math.max(0, math.floor(seconds + 0.5))
+    local format = G_reader_settings and G_reader_settings.readSetting
+        and G_reader_settings:readSetting("duration_format", "classic") or "classic"
+    if datetime and type(datetime.secondsToClockDuration) == "function" then
+        return datetime.secondsToClockDuration(format, seconds, true)
+    end
+    local minutes = math.floor(seconds / 60 + 0.5)
+    return string.format("%d:%02d", math.floor(minutes / 60), minutes % 60)
+end
+HighlightsDeToto._clockDuration = clockDuration
+
+--- «3:00 left · chapter 0:02», o solo el libro si no hay capitulo. nil si
+-- todavia no hay con que estimar.
+function HighlightsDeToto:_readingTimeLeftText()
+    if not self.book_hash or self._closed or not self:isFooterTimeLeftEnabled() then return nil end
+    local wpm = self:_readingPaceWpm()
+    if not wpm or wpm <= 0 then return nil end
+    local page = self.ui and self.ui.getCurrentPage and self.ui:getCurrentPage() or nil
+    local position = self:_readingPosition(page)
+    if not position then return nil end
+    local words_left = self:_readingWordsLeft(position)
+    if not words_left then return nil end
+    local format = HighlightsDeToto._clockDuration
+    local book = format(words_left / wpm * 60)
+    local chapter_seconds
+    local log = self.reading_log
+    local pace = log and log:pace()
+    local toc = self.ui and self.ui.toc
+    if pace and pace.screens > 0 and page and type(toc) == "table" and type(toc.getChapterPagesLeft) == "function" then
+        local ok, pages = pcall(toc.getChapterPagesLeft, toc, page, true)
+        if ok and type(pages) == "number" and pages >= 0 then
+            -- getChapterPagesLeft cuenta páginas y el ritmo es por pantalla: con
+            -- dos páginas a la vista, cada pantalla son dos.
+            local per_page = (pace.words / pace.screens) / math.max(1, self._visible_pages or 1)
+            chapter_seconds = pages * per_page / wpm * 60
+        end
+    end
+    if chapter_seconds then
+        return T(_("%1 left · chapter %2"), book, format(chapter_seconds))
+    end
+    return T(_("%1 left"), book)
+end
+
+--- El ritmo que el servidor mando en la consulta enfocada. Se guarda en los
+-- ajustes del libro: viaja con el guardado del sidecar que hace KOReader, el
+-- plugin no escribe nada por esto.
+function HighlightsDeToto:_applyReadingPace(response)
+    local pace = type(response) == "table" and response.reading_pace or nil
+    if type(pace) ~= "table" then return end
+    self._server_pace = { book = type(pace.book) == "table" and pace.book or nil,
+        account = type(pace.account) == "table" and pace.account or nil }
+    if self.ui and self.ui.doc_settings then
+        self.ui.doc_settings:saveSetting("borges_reading_pace", {
+            book = self._server_pace.book, account = self._server_pace.account, at = os.time(),
+        })
+    end
+end
+
+function HighlightsDeToto:_registerFooterTimeLeft()
+    if self._footer_time_left_fn or not self:isFooterTimeLeftEnabled() then return end
+    local footer = self.ui and self.ui.view and self.ui.view.footer
+    if type(footer) ~= "table" or type(footer.addAdditionalFooterContent) ~= "function" then
+        if not Shared.footer_api_missing_logged then
+            Shared.footer_api_missing_logged = true
+            logger.info("Borges: this KOReader has no external footer content; time left stays off")
+        end
+        return
+    end
+    self._footer_time_left_fn = function()
+        local ok, text = pcall(self._readingTimeLeftText, self)
+        if ok then return text end
+        return nil
+    end
+    footer:addAdditionalFooterContent(self._footer_time_left_fn)
+end
+
+function HighlightsDeToto:_unregisterFooterTimeLeft()
+    local fn = self._footer_time_left_fn
+    if not fn then return end
+    self._footer_time_left_fn = nil
+    local footer = self.ui and self.ui.view and self.ui.view.footer
+    if type(footer) == "table" and type(footer.removeAdditionalFooterContent) == "function" then
+        pcall(footer.removeAdditionalFooterContent, footer, fn)
+    end
+end
+
+function HighlightsDeToto:toggleFooterTimeLeft()
+    self.footer_time_left = not self:isFooterTimeLeftEnabled()
+    if self.footer_time_left then
+        if self.book_hash then self:_registerFooterTimeLeft() end
+    else
+        self:_unregisterFooterTimeLeft()
+    end
+    local footer = self.ui and self.ui.view and self.ui.view.footer
+    if type(footer) == "table" and type(footer.onUpdateFooter) == "function" then
+        pcall(footer.onUpdateFooter, footer, true)
+    end
+    self:saveSyncState()
+end
+
+--- Titulo y nivel de los capitulos que usa una tanda (solo esos).
+function HighlightsDeToto:_readingChapters(spans)
+    local toc = self.ui and self.ui.toc and self.ui.toc.toc
+    if type(toc) ~= "table" then return nil end
+    local chapters, any = {}, false
+    for _, span in ipairs(spans) do
+        local index = span.toc_index
+        if index and not chapters[tostring(index)] and type(toc[index]) == "table" then
+            chapters[tostring(index)] = {
+                title = ReadingLog.utf8Clip(toc[index].title, 200),
+                depth = tonumber(toc[index].depth),
+            }
+            any = true
+        end
+    end
+    return any and chapters or nil
+end
+
+--- Los tramos cerrados salen a la cola como `reading_span.recorded`, en tandas
+-- de a lo sumo 100 tramos y 28 KiB. Solo en las escrituras que el plugin ya
+-- hace: todo va con `defer` y lo guarda el flush de quien llama (con `defer`
+-- falso lo guarda esta funcion; solo lo usan las pruebas).
+function HighlightsDeToto:_enqueueReadingSpans(defer)
+    local log = self.reading_log
+    if not log or not self.book_hash or not self:isReadingSpansEnabled() or not self.sync_v2 then return 0 end
+    if log:count() == 0 then return 0 end
+    -- Lo que no se pudo contar antes (habia una seleccion abierta) se cuenta
+    -- ahora si es seguro; mas de 20 sin contar salen sin palabras.
+    self:_resolveReadingSpans(20)
+    local rows = log:drain()
+    if #rows == 0 then return 0 end
+    local book_hash = tostring(self.book_hash):lower()
+    local groups = {}
+    for _, row in ipairs(rows) do
+        local last = groups[#groups]
+        if last and last.view_mode == row.view_mode then
+            table.insert(last.rows, row)
+        else
+            table.insert(groups, { view_mode = row.view_mode or "page", rows = { row } })
+        end
+    end
+    local book = {
+        title = ReadingLog.utf8Clip(self.book_title, 500),
+        author = ReadingLog.utf8Clip(self.book_author, 500),
+        file = ReadingLog.utf8Clip(self.book_filename, 1000),
+        language = ReadingLog.utf8Clip(self._book_language, 64),
+    }
+    -- Una tabla vacia puede salir como lista en JSON y el servidor pide objeto.
+    if not next(book) then book = nil end
+    local tz = ReadingLog.tzOffsetMinutes()
+    local dropped = log.dropped or 0
+    local enqueued = 0
+    for _, group in ipairs(groups) do
+        local last_row = group.rows[#group.rows]
+        local page_count = tonumber(last_row.page_count or self.total_pages)
+        local header = {
+            v = 1, base_at = ReadingLog.isoMs(group.rows[1].started_wall_ms or 0), view_mode = group.view_mode,
+            page_count = page_count, tz_offset_min = tz, book = book, dropped = 999999, spans = {},
+        }
+        -- Lo que no son tramos cuenta contra el tope: el libro, y un lugar fijo
+        -- para los capítulos (fitChapters los hace entrar ahí).
+        local budget = ReadingLog.EVENT_BYTES - #rapidjson.encode(header) - ReadingLog.CHAPTERS_BYTES - 64
+        local chunks, bases, skipped = ReadingLog.chunk(group.rows, group.rows[1].started_wall_ms,
+            ReadingLog.EVENT_ROWS, budget, rapidjson.encode)
+        if skipped > 0 then
+            logger.warn("Borges: reading spans too large to send:", skipped)
+            dropped = dropped + skipped
+        end
+        for index, spans in ipairs(chunks) do
+            local base = bases[index]
+            local last_span = spans[#spans]
+            local ended_ms = base + (last_span.started_at_ms or 0) + (last_span.dwell_ms or 0)
+            enqueued = enqueued + 1
+            self.sync_v2:enqueue({
+                event_type = "reading_span.recorded",
+                aggregate_type = "reading_spans",
+                aggregate_id = "spans:" .. book_hash .. ":" .. string.format("%.0f", base) .. ":" .. enqueued,
+                book_identifier = self:_bookIdentifier(book_hash),
+                occurred_at = os.date("!%Y-%m-%dT%H:%M:%SZ", math.floor(ended_ms / 1000)),
+                time_precision = "exact",
+                payload = {
+                    v = 1, base_at = ReadingLog.isoMs(base), view_mode = group.view_mode, page_count = page_count,
+                    tz_offset_min = tz, book = book,
+                    chapters = ReadingLog.fitChapters(self:_readingChapters(spans), ReadingLog.CHAPTERS_BYTES,
+                        rapidjson.encode),
+                    dropped = dropped, spans = spans,
+                },
+            }, { defer = true })
+            dropped = 0
+        end
+    end
+    if log.dropped and log.dropped > 0 then
+        logger.warn("Borges: reading spans dropped by the memory cap:", log.dropped)
+        log.dropped = 0
+    end
+    self:_anchorReadingClock()
+    if not defer and enqueued > 0 then self.queue:flush() end
+    return enqueued
+end
+
+--- KOReader re-renderizo (letra, margenes): misma pantalla, otro texto.
+-- El PageUpdate del re-render llega antes y es la misma por XPointer: force.
+function HighlightsDeToto:onDocumentRerendered()
+    if self._closed or not self.book_hash then return end
+    if self._sampleDeviceState then self:_sampleDeviceState("rerender") end
+    if not self.reading_log then return end
+    self._pending_cause = "rerender"
+    self:_safecall("readingRerender", function()
+        self._visible_pages = self:_readVisiblePages()
+        local document = self.ui and self.ui.document
+        if type(document) == "table" and type(document.getPageCount) == "function" then
+            local ok, count = pcall(document.getPageCount, document)
+            if ok and type(count) == "number" then self.total_pages = count end
+        end
+        self:_recordReadingScreen(nil, { force = true, defer_resolve = true })
+    end)
 end
 
 --- Called when position changes (reflowable documents like EPUB/MOBI/AZW3).
@@ -2700,9 +3976,27 @@ end
 -- suspender, al cerrar). Leyendo sin red es el momento de dejar la posicion en
 -- la cola: una escritura chica cada tanto en vez de una por pausa de lectura.
 function HighlightsDeToto:onSaveSettings()
-    if not self.book_hash or self._closed or NetworkMgr:isConnected() then return end
+    if not self.book_hash or self._closed then return end
     if not self:isWebConfigured() then return end
-    self:_safecall("saveSettingsProgress", function() self:_enqueueProgressV2(false) end)
+    -- F1 (enmienda 3.7) · los tramos pendientes salen aca haya o no red: asi
+    -- una caida de KOReader pierde a lo sumo 15 minutos. Todo en UNA escritura
+    -- de la cola, y solo si hubo algo que guardar.
+    local spans = 0
+    if self.reading_log then
+        self:_safecall("saveSettingsSpans", function() spans = self:_enqueueReadingSpans(true) end)
+    end
+    -- F2 · las condiciones viajan en la misma escritura, y solo si la hay por
+    -- los tramos (enmienda 3.7): una muestra sola nunca arma una escritura ni
+    -- un intercambio al despertar.
+    if self._sampleDeviceState then self:_sampleDeviceState("save") end
+    if self._enqueueDeviceStates and (spans > 0 or self:_deviceStatesPiledUp()) then self:_safecall("saveSettingsStates", function() self:_enqueueDeviceStates() end) end
+    local progress
+    if not NetworkMgr:isConnected() then
+        self:_safecall("saveSettingsProgress", function() progress = self:_enqueueProgressV2(false, true) end)
+    end
+    if spans > 0 or progress then
+        self:_safecall("saveSettingsSave", function() self.queue:flush() end)
+    end
 end
 
 --- KOReader avisa cada vez que se crea, edita o borra una anotacion.
@@ -2717,6 +4011,13 @@ end
 -- Kobo disables WiFi before broadcasting Suspend, so this must not try to
 -- reconnect. The online last-chance flush happens in onNetworkDisconnecting.
 function HighlightsDeToto:onSuspend()
+    -- F2 · el motivo del sueno se decide antes de cerrar el tramo.
+    if self._sampleDeviceState then self:_sampleDeviceState("sleep") end
+    local sleep_fields = self._attention and self:_attentionSleepFields() or nil
+    -- F1 · la pantalla deja de estar a la vista: el tramo termina aca.
+    if self.reading_log then
+        self:_safecall("readingSuspend", function() self.reading_log:close(sleep_fields) end)
+    end
     self._background_suspended = true
     self:_cancelBackgroundSync()
     self.pairing:stopWatching()
@@ -2741,19 +4042,14 @@ function HighlightsDeToto:onSuspend()
 
     -- Donde el Wi-Fi sigue prendido al suspender (no es el caso del Kobo, que
     -- lo apaga antes), todo sale en un intercambio al final.
-    local upload_now = self.force_sync_before_sleep and NetworkMgr:isConnected()
+    local connected = NetworkMgr:isConnected()
+    local upload_now = self.force_sync_before_sleep and connected
 
     -- Todo lo de esta lectura se guarda en UNA escritura de la cola, al final:
     -- antes eran una por la posicion, una por la sesion y una por cada tanda de
     -- estadisticas.
     if not flushed_before_suspend then
-        self:_safecall("suspendProgress", function()
-            if upload_now or not NetworkMgr:isConnected() then
-                self:_enqueueProgressV2(false, true)
-            else
-                self:_pushProgressOrQueue()
-            end
-        end)
+        self:_safecall("suspendProgress", function() self:_enqueueProgressV2(false, true) end)
     end
 
     -- Finish session and always enqueue (no HTTP during suspend — keeps sleep fast)
@@ -2766,19 +4062,36 @@ function HighlightsDeToto:onSuspend()
     self:_safecall("suspendFlush", function() self:_flushSidecar() end)
 
     if upload_now then
+        -- F1 · los tramos entran antes de las estadisticas: syncPageStatsDelta guarda la
+        -- cola si encolo filas, y asi ese mismo guardado los lleva (ninguna escritura nueva).
+        -- F2 · las condiciones viajan con los tramos: solo si esta escritura los lleva.
+        local f2_spans = 0
+        if self.reading_log then self:_safecall("readingSpans", function() f2_spans = self:_enqueueReadingSpans(true) or 0 end) end
+        if self._enqueueDeviceStates and (f2_spans > 0 or self:_deviceStatesPiledUp()) then self:_safecall("deviceStates", function() self:_enqueueDeviceStates() end) end
         self:_safecall("forceSleepStats", function() self:syncPageStatsDelta(true) end)
-        self:_safecall("forceSleepHighlights", function() self:syncHighlightsDelta(false, true, true) end)
+        self:_safecall("forceSleepHighlights", function() self:syncHighlightsDelta(true) end)
         self:_safecall("forceSleepSave", function() self.queue:flush() end)
         self:_safecall("forceSleepQueueDrain", function() self:_drainQueueBlocking(true) end)
         return
     end
 
+    -- F1 · los tramos entran antes de las estadisticas: syncPageStatsDelta guarda la
+    -- cola si encolo filas, y asi ese mismo guardado los lleva (ninguna escritura nueva).
+    -- F2 · las condiciones viajan con los tramos: solo si esta escritura los lleva.
+    local f2_spans = 0
+    if self.reading_log then self:_safecall("readingSpans", function() f2_spans = self:_enqueueReadingSpans(true) or 0 end) end
+    if self._enqueueDeviceStates and (f2_spans > 0 or self:_deviceStatesPiledUp()) then self:_safecall("deviceStates", function() self:_enqueueDeviceStates() end) end
     if not flushed_before_suspend then
         -- Enqueue stats delta and highlights for sync on next resume
         self:_safecall("suspendStats", function() self:syncPageStatsDelta(true) end)
         self:_safecall("suspendHighlights", function() self:syncHighlightsDelta(true) end)
     end
     self:_safecall("suspendSave", function() self.queue:flush() end)
+    -- Con red y sin «sincronizar antes de dormir»: el mismo intercambio acotado
+    -- (antes `_pushProgressOrQueue`: hasta dos intercambios y cinco consultas).
+    if connected and not flushed_before_suspend then
+        self:_safecall("suspendQueueDrain", function() self:_drainQueueBlocking(true) end)
+    end
     self:_safecall("sleepUploadWithBook", function() self:_uploadBeforeSleep() end)
 end
 
@@ -2789,6 +4102,7 @@ function HighlightsDeToto:onResume()
     self._background_suspended = false
     self._reading_wifi_cancelled = false
     Shared.wifi_edge, Shared.wifi_auto_closed = false, false
+    Shared.sleep_exchange_this_suspension = false
     if self.pairing_state then self:watchDevicePairing(self.pairing_state, false) end
     self:_safecall("onResume", function()
         self:_closeSuspendSyncBanner()
@@ -2796,6 +4110,16 @@ function HighlightsDeToto:onResume()
         -- Start a fresh session
         if self.book_hash then
             self.session:start(self.book_hash, self.device_id, self.ui:getCurrentPage())
+        end
+        -- F2 · el tramo que abre despertar sale con causa "wake".
+        if self._sampleDeviceState then self:_sampleDeviceState("wake") end
+        if self.book_hash then self._pending_cause = "wake" end
+        -- F1 · despertar abre un tramo nuevo con el reloj re-anclado.
+        if self.book_hash and self.reading_log then
+            self:_safecall("readingResume", function()
+                self:_anchorReadingClock()
+                self:_recordReadingScreen(nil, { force = true, defer_resolve = true })
+            end)
         end
 
         if not self.book_hash then return end
@@ -2854,8 +4178,18 @@ end
 function HighlightsDeToto:onNetworkConnected()
     if Shared.wifi_edge then return end
     if self._reading_wifi_cancelled then return end
+    -- Todas las instancias reciben este aviso. La conexion silenciosa la toma
+    -- solo la instancia que la pidio (o cualquiera si esa ya se cerro), y solo
+    -- la instancia viva decide que el Wi-Fi es de la persona: antes el
+    -- explorador abierto detras del libro tomaba la conexion del libro, o la
+    -- declaraba ajena, y el plugin nunca apagaba el Wi-Fi que prendio.
     local quiet = Shared.wifi_quiet
-    Shared.wifi_quiet = nil
+    if quiet and quiet.owner ~= self and not quiet.owner._closed then
+        quiet = nil
+    else
+        Shared.wifi_quiet = nil
+    end
+    local decides = Shared.live == nil or Shared.live == self or Shared.live._closed
     if quiet then
         -- La conexion silenciosa que pidio el plugin: el Wi-Fi es suyo.
         if (self.wifi_quiet_misses or 0) > 0 then
@@ -2863,7 +4197,8 @@ function HighlightsDeToto:onNetworkConnected()
             self:saveSyncState(true)
         end
         self:_ownWifi()
-    elseif not (self._reading_wifi and self._reading_wifi.active and self._reading_wifi.enabled_wifi) then
+    elseif decides and not Shared.wifi_quiet
+        and not (self._reading_wifi and self._reading_wifi.active and self._reading_wifi.enabled_wifi) then
         -- Una conexion que no abrio el plugin es de la persona: no se apaga sola.
         Shared.wifi_owned, Shared.wifi_auto_closed = false, false
     end
@@ -2929,8 +4264,22 @@ function HighlightsDeToto:onNetworkDisconnecting()
             end)
         end
         self:_safecall("disconnectingFlush", function() self:_flushSidecar() end)
+        -- F1 · como la sesion: si el lector se va a dormir, la pantalla deja de
+        -- estar a la vista aca y su tramo viaja en este mismo intercambio.
+        if Device.screen_saver_mode == true and self.reading_log then
+            if self._sampleDeviceState then self:_sampleDeviceState("sleep") end
+            local sleep_fields = self._attention and self:_attentionSleepFields() or nil
+            self:_safecall("readingSleepClose", function() self.reading_log:close(sleep_fields) end)
+        end
+        -- F1 · los tramos entran antes de las estadisticas: syncPageStatsDelta guarda la
+        -- cola si encolo filas, y asi ese mismo guardado los lleva (ninguna escritura nueva).
+        -- F2 · las condiciones viajan con los tramos: solo si esta escritura los lleva.
+        local f2_spans = 0
+        if self.reading_log then self:_safecall("readingSpans", function() f2_spans = self:_enqueueReadingSpans(true) or 0 end) end
+        if self._enqueueDeviceStates and (f2_spans > 0 or self:_deviceStatesPiledUp()) then self:_safecall("deviceStates", function() self:_enqueueDeviceStates() end) end
         self:_safecall("disconnectingStats", function() self:syncPageStatsDelta(true) end)
-        self:_safecall("disconnectingHighlights", function() self:syncHighlightsDelta(false, true, true) end)
+        -- Solo comparar y encolar: la foto historica nunca sale al cortarse la red.
+        self:_safecall("disconnectingHighlights", function() self:syncHighlightsDelta(true) end)
         self:_safecall("disconnectingSave", function() self.queue:flush() end)
         self._disconnect_flush_book_hash = self.book_hash
         self._disconnect_flush_at = os.time()
@@ -3046,7 +4395,7 @@ function HighlightsDeToto:pullProgress()
                 return
             end
             if server_page > local_page then
-                self.ui:handleEvent(Event:new("GotoPage", server_page))
+                if self._syncJump then self:_syncJump(Event:new("GotoPage", server_page)) else self.ui:handleEvent(Event:new("GotoPage", server_page)) end
                 logger.info("Borges: Auto-jumped to page", server_page,
                     "(was", local_page, ") same device PDF")
                 UIManager:scheduleIn(2, function()
@@ -3085,45 +4434,40 @@ end
 -- @param server_data table the result.latest from GET /api/progress
 -- @param same_device boolean true if server_data came from this same device_id
 -- @return boolean true if navigation was performed
+--- Camino sincronico (sin buscar texto; lo usa pullProgress y el "deshacer"):
+-- XPointer propio verificado, la misma pagina del mismo archivo,
+-- capitulo + fraccion, porcentaje. Devuelve true, method.
 function HighlightsDeToto:_navigateToProgress(server_data, same_device)
-    local local_page = self.ui:getCurrentPage()
-
-    -- For reflowable docs (EPUB): prefer xpointer (device-independent)
-    if not self.has_pages and server_data.xpointer and server_data.xpointer ~= "" then
-        -- onGotoXPointer does not check it: one not in this DOM would move nowhere and still be saved.
-        if self:_isValidXPointer(server_data.xpointer) then
-            self.ui:handleEvent(Event:new("GotoXPointer", server_data.xpointer))
-            logger.info("Borges: Navigated via xpointer")
-            return true
-        end
-        logger.warn("Borges: xpointer not in this document, using percentage:", server_data.xpointer)
+    if type(server_data) ~= "table" then return false end
+    -- onGotoXPointer does not check it: one not in this DOM would move nowhere and still be saved.
+    local target, method = PositionLocator.resolveSync(self.ui, server_data, {
+        has_pages = self.has_pages == true,
+        total_pages = self.total_pages,
+        same_device = same_device == true,
+        percentage = _safePct(server_data.percentage),
+    })
+    if not self.has_pages and server_data.xpointer and server_data.xpointer ~= ""
+        and method ~= "xpointer" then
+        logger.warn("Borges: xpointer not in this document, using", tostring(method), server_data.xpointer)
     end
-
-    -- For paged docs (PDF/DJVU) on same device: use page number directly
-    if self.has_pages and same_device then
-        local page = server_data.current_page
-        if page and page >= 1 and self.total_pages and page <= self.total_pages then
-            self.ui:handleEvent(Event:new("GotoPage", page))
-            return true
-        end
-    end
-
-    -- Fallback: percentage (for paged docs cross-device, or when xpointer is missing)
-    local pct = _safePct(server_data.percentage)
-    if pct >= 0 and self.total_pages and self.total_pages > 0 then
-        local calc = math.floor(pct / 100 * self.total_pages + 0.5)
-        local target = math.max(1, math.min(calc, self.total_pages))
-        self.ui:handleEvent(Event:new("GotoPage", target))
-        return true
-    end
-
-    return false
+    if not target then return false end
+    self:_gotoTarget(target)
+    logger.info("Borges: Navigated via", method)
+    return true, method
 end
 
 --- Calculate display page for server progress (for UI messages only, not navigation).
 -- @param server_data table the result.latest from GET /api/progress
 -- @return number|nil approximate local page number
 function HighlightsDeToto:_calcDisplayPage(server_data)
+    -- F6: por capitulo y fraccion cuando el capitulo existe en este libro.
+    if type(server_data.locator) == "table" and self.total_pages and self.total_pages > 0 then
+        local ok, mapped = pcall(PositionLocator.localPercent, self.ui, server_data.locator, self.total_pages)
+        if ok and mapped then
+            local page = math.floor(mapped / 100 * self.total_pages) + 1
+            return math.max(1, math.min(page, self.total_pages))
+        end
+    end
     local pct = _safePct(server_data.percentage)
     if pct >= 0 and self.total_pages and self.total_pages > 0 then
         local calc = math.floor(pct / 100 * self.total_pages + 0.5)
@@ -3712,11 +5056,98 @@ function HighlightsDeToto:syncCurrentBookBothWays()
     end)
 end
 
+--- La clave con la que se marca que un libro ya mando su foto historica.
+function HighlightsDeToto:_bridgeKey()
+    return self.book_key or self.book_hash
+end
+
+--- La foto historica de un libro (la importacion de lo subrayado antes de
+-- Borges v2), en segundo plano y por partes. Antes salia de una vez dentro de
+-- `syncHighlightsDelta`, incluso al dormir: un libro de 800 subrayados era un
+-- pedido de cientos de KB con la pantalla esperando.
+--
+-- Solo corre dentro de una corrutina de `Background`. Arma la foto del sidecar
+-- en disco y la manda en tandas de BRIDGE_CHUNK_ENTRIES entradas con el mismo
+-- encabezado de documento, cediendo la pantalla entre una y otra. El libro
+-- queda marcado recien cuando salieron todas: una tanda que falla deja el
+-- libro sin marcar y la proxima vez se manda entera otra vez (el servidor
+-- deduplica por texto).
+-- @return number|nil entradas enviadas, o nil y el motivo
+function HighlightsDeToto:_bridgeHistoryInBackground()
+    if not Background.current() then return nil, "not_background" end
+    if self._closed or self._background_suspended then return nil, "not_now" end
+    local key = self:_bridgeKey()
+    if not key or not self:isWebConfigured() then return nil, "no_book" end
+    if self.annotation_v2_bridged[key] == true then return 0 end
+    if not NetworkMgr:isConnected() then return nil, "offline" end
+    local file_path = self.book_file_path or (self.ui and self.ui.document and self.ui.document.file)
+    if not file_path then return nil, "no_file" end
+    -- Un libro sin ninguna anotacion no tiene historia que importar.
+    local annotation_module = self.ui and self.ui.annotation
+    if annotation_module and type(annotation_module.annotations) == "table"
+        and #annotation_module.annotations == 0 then
+        return 0
+    end
+    local payload, count = HighlightParser:generateApiPayloadForBook(file_path)
+    if not payload or (count or 0) == 0 then return 0 end
+    self:_attachCurrentBookHash(payload)
+    local document = payload.documents and payload.documents[1]
+    if type(document) ~= "table" or type(document.entries) ~= "table" then return 0 end
+
+    -- La foto sale del sidecar en DISCO. Un subrayado que ya se sabe borrado
+    -- (la cola lo anoto `present = false`, o hay un borrado recibido esperando
+    -- su libro en el inbox) no puede viajar: `/api/sync` lo volveria a crear.
+    local removed = {}
+    for sync_id, entry in pairs(self.queue:getAnnotationState(self:_annotationStateKey())) do
+        if type(entry) == "table" and entry.present == false then removed[sync_id] = true end
+    end
+    if self.queue:inboxCountForBook(self:_bookIdentifier(self.book_hash)) > 0 then
+        for _, event in ipairs(self.queue:getInbox()) do
+            if (event.event_type == "annotation.deleted" or event.event_type == "bookmark.deleted")
+                and type(event.aggregate_id) == "string" then
+                removed[event.aggregate_id:lower()] = true
+            end
+        end
+    end
+    local entries, sent = {}, 0
+    for _, entry in ipairs(document.entries) do
+        if not (type(entry.sync_id) == "string" and removed[entry.sync_id:lower()]) then
+            table.insert(entries, entry)
+        end
+    end
+    for first = 1, #entries, BRIDGE_CHUNK_ENTRIES do
+        if self._closed or self._background_suspended or not NetworkMgr:isConnected() then
+            return nil, "interrupted"
+        end
+        local chunk = {}
+        for index = first, math.min(#entries, first + BRIDGE_CHUNK_ENTRIES - 1) do
+            table.insert(chunk, entries[index])
+        end
+        local part = {}
+        for field, value in pairs(document) do part[field] = value end
+        part.entries = chunk
+        local part_payload = {}
+        for field, value in pairs(payload) do part_payload[field] = value end
+        part_payload.documents = { part }
+        local result, err = self:getApi():postJSON(self.web_url, self:getWebAuth(), part_payload, true)
+        if not result then
+            logger.warn("Borges: historical annotation bridge deferred:", tostring(err))
+            return nil, err
+        end
+        sent = sent + #chunk
+        Background.yieldToUI()
+    end
+    self.annotation_v2_bridged[key] = true
+    self:saveSyncState(true)
+    logger.info("Borges: historical annotation bridge imported", sent, "entries")
+    return sent
+end
+
 --- Sync current-book annotations through the durable v2 outbox.
--- The first successful sync per edition also sends the historical snapshot to
--- the legacy endpoint. That imports old rows and registers the partial-MD5
--- identifier before incremental create/update/delete takes over.
--- @param enqueue_only boolean (optional) if true, always enqueue instead of POSTing (for suspend)
+-- Compara el sidecar con lo ya sincronizado y encola los cambios. La foto
+-- historica del libro ya no sale de aca: la manda `_bridgeHistoryInBackground`
+-- en segundo plano y por partes, nunca al dormir.
+-- @param enqueue_only boolean (optional) if true, never exchange (for suspend)
 -- @param quick boolean (optional) use shorter HTTP timeout (5/10s) — for close/disconnect paths
 function HighlightsDeToto:syncHighlightsDelta(enqueue_only, quick, defer_exchange)
     if not self.book_hash then return end
@@ -3729,49 +5160,9 @@ function HighlightsDeToto:syncHighlightsDelta(enqueue_only, quick, defer_exchang
         return
     end
 
-    local bridged = self.annotation_v2_bridged[self.book_hash] == true
-    local payload, count
-    if not bridged and not enqueue_only and NetworkMgr:isConnected() then
-        -- La foto historica se manda una sola vez por edicion. Armarla relee y
-        -- vuelve a interpretar el sidecar entero del disco: solo vale la pena
-        -- cuando de verdad se va a mandar, no en cada suspension.
-        -- La foto sale del sidecar que esta en el disco. Puede no tener lo
-        -- subrayado desde el ultimo guardado de KOReader, y no importa: eso
-        -- viaja igual como eventos v2 en la comparacion de abajo. Un libro sin
-        -- ninguna anotacion no tiene historia que importar.
-        local annotation_module = self.ui and self.ui.annotation
-        local annotated = not annotation_module or type(annotation_module.annotations) ~= "table"
-            or #annotation_module.annotations > 0
-        if annotated then
-            payload, count = HighlightParser:generateApiPayloadForBook(file_path)
-        end
-        if payload then self:_attachCurrentBookHash(payload) end
-    end
-    count = count or 0
-
-    if not bridged and payload and count > 0
-        and not enqueue_only and NetworkMgr:isConnected() then
-        local result, err = self:getApi():postJSON(
-            self.web_url,
-            self:getWebAuth(),
-            payload,
-            quick
-        )
-        if result then
-            self.annotation_v2_bridged[self.book_hash] = true
-            bridged = true
-            logger.info(
-                "Borges: historical annotation bridge imported",
-                count,
-                "entries"
-            )
-        else
-            logger.warn(
-                "Borges: historical annotation bridge deferred:",
-                tostring(err)
-            )
-        end
-    end
+    local bridged = self.annotation_v2_bridged[self:_bridgeKey()] == true
+    -- Dormido no sale ningun pedido de aca, aunque se lo pidan.
+    if self._background_suspended then enqueue_only = true end
 
     -- El tiempo queda en el log a proposito: es la unica medicion que se
     -- puede hacer en el lector mismo, y permite comparar versiones leyendo el
@@ -4141,6 +5532,15 @@ function HighlightsDeToto:loadSettings()
     self.force_sync_before_sleep = settings.force_sync_before_sleep ~= false
     self.wifi_only_to_sync = settings.wifi_only_to_sync == true
     self.wifi_only_to_sync_note = settings.wifi_only_to_sync_note
+    -- F1 · medir la lectura en palabras: prendido salvo que se apague a mano.
+    self.reading_spans_enabled = settings.reading_spans ~= false
+    -- F2 · las tres capturas, prendidas salvo que se apaguen a mano.
+    self.capture_nav_cause = settings.capture_nav_cause ~= false
+    self.capture_attention = settings.capture_attention ~= false
+    self.capture_device_state = settings.capture_device_state ~= false
+    self.footer_time_left = settings.footer_time_left ~= false
+    -- F6: guardar el texto de donde quedaste viene prendido.
+    self.position_text_capture = settings.position_text_capture ~= false
     self.wifi_quiet_misses = tonumber(settings.wifi_quiet_misses) or 0
     self.last_web_sync = settings.last_web_sync or 0
     self.synced_books = settings.synced_books or {}
@@ -4273,6 +5673,12 @@ function HighlightsDeToto:_currentSettings()
         force_sync_before_sleep = self.force_sync_before_sleep,
         wifi_only_to_sync = self.wifi_only_to_sync == true or nil,
         wifi_only_to_sync_note = self.wifi_only_to_sync_note,
+        reading_spans = self.reading_spans_enabled == false and false or nil,
+        capture_nav_cause = self.capture_nav_cause == false and false or nil,
+        capture_attention = self.capture_attention == false and false or nil,
+        capture_device_state = self.capture_device_state == false and false or nil,
+        footer_time_left = self.footer_time_left == false and false or nil,
+        position_text_capture = self.position_text_capture == false and false or nil,
         wifi_quiet_misses = (self.wifi_quiet_misses or 0) > 0 and self.wifi_quiet_misses or nil,
         last_web_sync = self.last_web_sync,
         synced_books = self.synced_books,
@@ -5181,6 +6587,22 @@ function HighlightsDeToto:showSyncStatusDetail()
     end
     if self.queue:rejectedCount() > 0 then
         table.insert(lines, T(_("Rejected by the server: %1"), self.queue:rejectedCount()))
+    end
+    -- F5 · Que paso con los rechazos y con lo recibido que no entro.
+    local rejections = self.queue.rejectionSummary and self.queue:rejectionSummary() or {}
+    if rejections.last_code then
+        table.insert(lines, T(_("Last rejection: %1"), rejections.last_code))
+    end
+    if (rejections.pending_reemit or 0) > 0 then
+        table.insert(lines, T(_("Will be sent again: %1"), rejections.pending_reemit))
+    end
+    local dropped = self.queue.inboxDroppedCount and self.queue:inboxDroppedCount() or 0
+    if dropped > 0 then
+        table.insert(lines, T(_("Received changes dropped (inbox full): %1"), dropped))
+    end
+    local skew = self.queue.getClockSkew and self.queue:getClockSkew()
+    if skew and math.abs(skew) >= 300 then
+        table.insert(lines, T(_("This reader's clock is off by %1 minutes."), math.floor(math.abs(skew) / 60 + 0.5)))
     end
     if self.last_full_sync and self.last_full_sync > 0 then
         table.insert(lines, T(_("Last complete sync: %1"),

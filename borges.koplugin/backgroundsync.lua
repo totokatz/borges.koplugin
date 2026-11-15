@@ -14,9 +14,10 @@ function Background.current()
     return thread and running[thread] or nil
 end
 
-function Background.request(work)
+--- @param opts table|nil { timeout = segundos } (default: el de la instancia)
+function Background.request(work, opts)
     assert(Background.current(), "background request outside sync coroutine")
-    return coroutine.yield(work)
+    return coroutine.yield(work, opts)
 end
 
 function Background.yieldToUI()
@@ -73,7 +74,7 @@ function Background:_resume(...)
     if self.cancelled or (self.valid and not self.valid()) then
         return self:_finish(false, failure("background_cancelled"))
     end
-    local ok, work = coroutine.resume(self.thread, ...)
+    local ok, work, opts = coroutine.resume(self.thread, ...)
     if not ok then return self:_finish(false, failure("background_sync_failed")) end
     if coroutine.status(self.thread) == "dead" then return self:_finish(true) end
     if work == false then
@@ -84,7 +85,7 @@ function Background:_resume(...)
         self.ui:scheduleIn(0.05, self.resume_task)
         return
     end
-    self:_startRequest(work)
+    self:_startRequest(work, type(opts) == "table" and tonumber(opts.timeout) or nil)
 end
 
 function Background:_readAvailable(fd)
@@ -102,7 +103,7 @@ function Background:_readAvailable(fd)
     return ffi.string(buffer, count)
 end
 
-function Background:_startRequest(work)
+function Background:_startRequest(work, timeout)
     if type(self.util.runInSubProcess) ~= "function"
         or type(self.util.getNonBlockingReadSize) ~= "function" then
         return self:_resume(nil, failure("background_unavailable"))
@@ -119,7 +120,7 @@ function Background:_startRequest(work)
     end, true)
     if not started or not pid then return self:_resume(nil, failure("background_unavailable")) end
     self.pid = pid
-    local chunks, size, deadline, transport_error = {}, 0, self.now() + self.timeout
+    local chunks, size, deadline, transport_error = {}, 0, self.now() + (timeout or self.timeout)
     local poll
     poll = function()
         if self.valid and not self.valid() then self:cancel() end
