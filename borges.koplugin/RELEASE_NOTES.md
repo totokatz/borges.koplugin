@@ -8,6 +8,11 @@ release. Una versión sin sección se ofrece igual, sin novedades para mostrar.
 Escribí en criollo y en presente, una línea por cambio, pensando en alguien
 que está por tocar «Actualizar» en un lector de tinta electrónica.
 
+## 2026.11.17.1
+
+- New: Borges > Library > Time per chapter. It shows how long each chapter of the open book took you, from KOReader's own reading statistics, and next to it the time KOReader estimated when you started that chapter (the same "⤻" figure of the status bar). Tap a chapter to see the details. It works without Wi-Fi.
+- The web shows the same list in "How you read this book", for your whole reading history. For that, the reader sends the table of contents of the book once, when it changes. Only chapter titles and pages, never the text.
+
 ## 2026.11.15.1
 
 - Putting the reader to sleep is faster. It sends your position and reading time first, in one short step, and anything left over goes out later in the background instead of holding the screen.

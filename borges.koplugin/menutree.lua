@@ -171,6 +171,15 @@ function MenuTree.build(plugin, deps)
                 keep_menu_open = true,
                 enabled_func = enabled("biblioteca.undo", function() return plugin:canUndoPositionJump() end),
                 callback = action("biblioteca.undo", function() plugin:undoPositionJump() end),
+                separator = true,
+            },
+            {
+                -- Solo con un libro abierto: el índice es el de ese libro.
+                text = _("Time per chapter"),
+                help_text = _("How long each chapter of this book took you, from KOReader's own reading statistics, next to the time KOReader estimated when you started it. Works without Wi-Fi."),
+                keep_menu_open = true,
+                show_func = shown("biblioteca.chapters", function() return plugin:hasOpenBook() end),
+                callback = action("biblioteca.chapters", function() plugin:showChapterTimes() end),
             },
         }
     end

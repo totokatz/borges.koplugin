@@ -58,6 +58,7 @@ local ReadingLog = require("readinglog")
 local NavCause = require("navcause")
 local Attention = require("attention")
 local DeviceState = require("devicestate")
+local ChapterTime = require("chaptertime")
 local ui_time_ok, UITime = pcall(require, "ui/time")
 if not ui_time_ok or type(UITime) ~= "table" then UITime = nil end
 local datetime_ok, datetime = pcall(require, "datetime")
@@ -3077,6 +3078,8 @@ function HighlightsDeToto:onCloseDocument()
     if self.reading_log then self:_safecall("readingSpans", function() self:_enqueueReadingSpans(true) end) end
     -- F2 · las condiciones del libro que se cierra, en esta misma escritura.
     if self._enqueueDeviceStates then self:_safecall("deviceStates", function() self:_enqueueDeviceStates() end) end
+    -- El indice del libro, si cambio desde la ultima vez (tiempo por capitulo).
+    if self._enqueueChapterToc then self:_safecall("chapterToc", function() self:_enqueueChapterToc() end) end
     -- 4. Persist the statistics delta for the same background drain.
     self:_safecall("statsSync", function()
         self:syncPageStatsDelta(true)
@@ -3805,6 +3808,239 @@ function HighlightsDeToto:toggleFooterTimeLeft()
     self:saveSyncState()
 end
 
+-- ------------------------------------------------------------
+-- Tiempo por capitulo, con los numeros de KOReader
+-- ------------------------------------------------------------
+-- Cuanto te llevo cada capitulo sale de page_stat_data (las estadisticas de
+-- KOReader, no de Borges), repartido con el indice del libro en la paginacion
+-- actual. Al lado, lo que el pie de KOReader («⤻») te decia al entrar al
+-- capitulo. La cuenta vive en chaptertime.lua, igual a shared/chapterTime.js.
+-- Nada de esto corre al pasar pagina: solo al abrir la pantalla y al cerrar el
+-- libro (el indice viaja para que la web haga la misma cuenta).
+
+local CHAPTER_TOC_MAX_BYTES = 28 * 1024
+local CHAPTER_TOC_MAX_ENTRIES = 1500
+
+function HighlightsDeToto:hasOpenBook()
+    return self.book_hash ~= nil and not self._closed and self.ui ~= nil and self.ui.document ~= nil
+end
+
+--- El indice como lo navega KOReader: si los capitulos estan atados a las
+-- marcas y hay niveles ignorados, esos niveles no cuentan como capitulo.
+function HighlightsDeToto:_chapterTocEntries()
+    local toc = self.ui and self.ui.toc
+    if type(toc) ~= "table" then return nil end
+    if type(toc.fillToc) == "function" then pcall(toc.fillToc, toc) end
+    if type(toc.toc) ~= "table" or #toc.toc == 0 then return nil end
+    local ignored = toc.toc_chapter_navigation_bind_to_ticks and type(toc.toc_ticks_ignored_levels) == "table"
+        and toc.toc_ticks_ignored_levels or nil
+    local entries = {}
+    for index, item in ipairs(toc.toc) do
+        local page = tonumber(item.page)
+        if page and not (ignored and ignored[item.depth]) then
+            entries[#entries + 1] = { toc_index = index, page = page, depth = tonumber(item.depth) or 1,
+                title = type(item.title) == "string" and item.title or "" }
+        end
+        if #entries >= CHAPTER_TOC_MAX_ENTRIES then break end
+    end
+    return #entries > 0 and entries or nil
+end
+
+function HighlightsDeToto:_statisticsMaxSec()
+    local stats = self.ui and self.ui.statistics
+    local settings = type(stats) == "table" and stats.settings or nil
+    local max_sec = type(settings) == "table" and tonumber(settings.max_sec) or nil
+    return max_sec or ChapterTime.DEFAULT_MAX_SEC
+end
+
+--- Las filas de page_stat_data de este libro. Antes vuelca lo que KOReader
+-- tiene en memoria de esta lectura (lo mismo que hace su propia pantalla de
+-- estadisticas), asi la sesion en curso cuenta.
+function HighlightsDeToto:_chapterPageRows()
+    local stats = self.ui and self.ui.statistics
+    if type(stats) == "table" and type(stats.insertDB) == "function"
+        and type(stats.settings) == "table" and stats.settings.is_enabled then
+        local ok, err = pcall(stats.insertDB, stats)
+        if not ok then logger.warn("Borges: statistics insertDB error:", err) end
+    end
+    local conn, err = StatSync:openDB()
+    if not conn then return nil, err end
+    local rows = {}
+    local ok, query_err = pcall(function()
+        local id_book = type(stats) == "table" and tonumber(stats.id_curr_book) or nil
+        local where
+        if id_book then
+            where = string.format("id_book = %d", id_book)
+        else
+            local md5 = tostring(self.book_hash or ""):lower()
+            if not md5:match("^%x+$") then return end
+            where = string.format("id_book IN (SELECT id FROM book WHERE md5 = '%s')", md5)
+        end
+        local stmt = conn:prepare("SELECT page, start_time, duration, total_pages FROM page_stat_data WHERE " .. where)
+        local row = stmt:step({})
+        while row do
+            rows[#rows + 1] = { page = tonumber(row[1]), start_time = tonumber(row[2]),
+                duration = tonumber(row[3]), total_pages = tonumber(row[4]) }
+            row = stmt:step(row)
+        end
+        stmt:close()
+    end)
+    pcall(function() conn:close() end)
+    if not ok then
+        logger.warn("Borges: chapter time query error:", query_err)
+        return nil, "query"
+    end
+    return rows
+end
+
+function HighlightsDeToto:_chapterTimeReport()
+    local entries = self:_chapterTocEntries()
+    if not entries then return nil, "no_toc" end
+    local page_count = self.ui.document and self.ui.document.getPageCount and self.ui.document:getPageCount()
+    local rows, err = self:_chapterPageRows()
+    if not rows then return nil, err == "statistics.sqlite3 not found" and "no_stats" or "query" end
+    return ChapterTime.compute({ entries = entries, page_count = page_count, rows = rows,
+        max_sec = self:_statisticsMaxSec() })
+end
+
+local function chapterPercent(ratio)
+    return math.floor(math.abs(ratio - 1) * 100 + 0.5)
+end
+
+--- Las filas del pie de la lista: que tanto la pego KOReader. Cortas, porque
+-- la columna de la izquierda de KeyValuePage corta lo que no entra.
+function HighlightsDeToto:_chapterSummaryRows(summary)
+    if type(summary) ~= "table" or not summary.median_ratio then
+        return { { _("Compared with KOReader"), _("not yet") } }
+    end
+    local ratio = summary.median_ratio
+    local diff
+    if ratio >= 0.95 and ratio <= 1.05 then
+        diff = "="
+    else
+        diff = T(_("%1%"), (ratio > 1 and "+" or "-") .. chapterPercent(ratio))
+    end
+    return {
+        { _("Your time vs. KOReader"), diff },
+        { _("Chapters within 20%"), T(_("%1 of %2"), summary.within_20_percent, summary.chapters) },
+        { _("⤻ KOReader's estimate"), _("when you started") },
+    }
+end
+
+function HighlightsDeToto:_chapterDetailText(chapter)
+    local format = HighlightsDeToto._clockDuration
+    local lines = {
+        chapter.title ~= "" and chapter.title or _("Untitled chapter"),
+        T(_("Pages %1 to %2 · %3 of %4 read"), chapter.first_page, chapter.last_page, chapter.pages_read, chapter.pages),
+        T(_("Time in this chapter: %1"), format(chapter.seconds)),
+    }
+    local ko = chapter.koreader
+    if ko then
+        table.insert(lines, "")
+        table.insert(lines, T(_("When you reached page %1, KOReader estimated %2 for the rest of the chapter: %3 pages at %4 seconds each."),
+            ko.entry_page, format(ko.estimate_seconds), ko.pages_left, math.floor(ko.avg_page_seconds + 0.5)))
+        if ko.comparable then
+            table.insert(lines, T(_("The rest took you %1."), format(ko.actual_seconds)))
+        else
+            table.insert(lines, _("Not compared: you did not read this chapter from its start to its end."))
+        end
+    end
+    return table.concat(lines, "\n")
+end
+
+function HighlightsDeToto:_chapterTimesKv(report)
+    local format = HighlightsDeToto._clockDuration
+    local kv, unread, total = {}, 0, 0
+    for _, chapter in ipairs(report.chapters) do
+        if chapter.seconds > 0 then
+            total = total + chapter.seconds
+            local title = chapter.title ~= "" and chapter.title or _("Untitled chapter")
+            if (chapter.depth or 1) > 1 then title = string.rep("  ", chapter.depth - 1) .. title end
+            local value = format(chapter.seconds)
+            if chapter.koreader and chapter.koreader.comparable then
+                value = value .. " · ⤻ " .. format(chapter.koreader.estimate_seconds)
+            end
+            local detail = self:_chapterDetailText(chapter)
+            table.insert(kv, { title, value, callback = function()
+                UIManager:show(InfoMessage:new{ text = detail })
+            end })
+        else
+            unread = unread + 1
+        end
+    end
+    if #kv == 0 then return nil end
+    table.insert(kv, "----")
+    table.insert(kv, { _("Total"), format(total) })
+    if unread > 0 then table.insert(kv, { _("Chapters not started"), tostring(unread) }) end
+    for _, row in ipairs(self:_chapterSummaryRows(report.summary)) do table.insert(kv, row) end
+    return kv
+end
+
+function HighlightsDeToto:showChapterTimes()
+    if not self:hasOpenBook() then return end
+    local report, err = self:_chapterTimeReport()
+    if not report then
+        if err == "no_toc" then
+            self:showInfo(_("This book has no table of contents, so there are no chapters to measure."), 6)
+        elseif err == "no_stats" then
+            self:showInfo(_("KOReader has no reading statistics yet. Turn on Reading statistics in KOReader's tools menu."), 8)
+        else
+            self:showInfo(_("Could not read KOReader's reading statistics."), 6)
+        end
+        return
+    end
+    local kv = self:_chapterTimesKv(report)
+    if not kv then
+        self:showInfo(_("KOReader has not timed any page of this book yet."), 6)
+        return
+    end
+    local KeyValuePage = require("ui/widget/keyvaluepage")
+    UIManager:show(KeyValuePage:new{
+        title = _("Time per chapter"),
+        value_overflow_align = "right",
+        kv_pairs = kv,
+    })
+end
+
+--- El indice viaja una vez por cambio (otro tamano de letra cambia las
+-- paginas): asi la web reparte las mismas filas de page_stat_data en los
+-- mismos capitulos. Sale con la escritura de cola que el cierre ya hace.
+function HighlightsDeToto:_enqueueChapterToc()
+    if not self.sync_v2 or not self.book_hash or not self.ui or not self.ui.doc_settings then return false end
+    local entries = self:_chapterTocEntries()
+    if not entries then return false end
+    local page_count = self.ui.document and self.ui.document.getPageCount and self.ui.document:getPageCount()
+    if not page_count then return false end
+    local max_sec = self:_statisticsMaxSec()
+    local sum = 0
+    for i, entry in ipairs(entries) do sum = (sum + entry.page * i + entry.toc_index * 7) % 1000000007 end
+    local fingerprint = table.concat({ page_count, #entries, sum, max_sec }, ":")
+    if self.ui.doc_settings:readSetting("borges_toc_sent") == fingerprint then return false end
+    local clip, wire = 120, nil
+    while true do
+        wire = {}
+        for _, entry in ipairs(entries) do
+            wire[#wire + 1] = { i = entry.toc_index, p = entry.page, d = entry.depth,
+                t = ReadingLog.utf8Clip(entry.title, clip) or "" }
+        end
+        if #rapidjson.encode(wire) <= CHAPTER_TOC_MAX_BYTES then break end
+        if clip <= 8 then return false end
+        clip = math.floor(clip / 2)
+    end
+    local book_hash = tostring(self.book_hash):lower()
+    self.sync_v2:enqueue({
+        event_type = "book_toc.recorded",
+        aggregate_type = "book_toc",
+        aggregate_id = "book_toc:" .. book_hash .. ":" .. fingerprint,
+        book_identifier = self:_bookIdentifier(book_hash),
+        occurred_at = os.date("!%Y-%m-%dT%H:%M:%SZ"),
+        time_precision = "exact",
+        payload = { v = 1, page_count = page_count, max_sec = max_sec, entries = wire },
+    }, { defer = true })
+    self.ui.doc_settings:saveSetting("borges_toc_sent", fingerprint)
+    return true
+end
+
 --- Titulo y nivel de los capitulos que usa una tanda (solo esos).
 function HighlightsDeToto:_readingChapters(spans)
     local toc = self.ui and self.ui.toc and self.ui.toc.toc
@@ -3994,7 +4230,10 @@ function HighlightsDeToto:onSaveSettings()
     if not NetworkMgr:isConnected() then
         self:_safecall("saveSettingsProgress", function() progress = self:_enqueueProgressV2(false, true) end)
     end
+    -- El indice (tiempo por capitulo) solo viaja en una escritura que ya
+    -- ocurre, y aca KOReader guarda despues el sidecar con la marca de enviado.
     if spans > 0 or progress then
+        if self._enqueueChapterToc then self:_safecall("saveSettingsToc", function() self:_enqueueChapterToc() end) end
         self:_safecall("saveSettingsSave", function() self.queue:flush() end)
     end
 end
